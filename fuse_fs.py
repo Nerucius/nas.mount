@@ -91,6 +91,8 @@ class SmbFileContext:
 
 class SmbFileSystemOperations(BaseFileSystemOperations):
 
+    WRITE_PIPELINE_DEPTH = 4
+
     def __init__(self, smb_client, subpath="", dir_cache_ttl=300):
         super().__init__()
         self._smb = smb_client
@@ -98,6 +100,7 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
         self._dir_cache_ttl = dir_cache_ttl
         self._dir_cache = {}
         self._cache_lock = threading.Lock()
+        self._write_flush_size = smb_client.write_size * self.WRITE_PIPELINE_DEPTH
 
     def _flush_write_buf(self, file_context):
         buf = file_context._wbuf
@@ -457,7 +460,7 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
             data = bytes(buffer)
             length = len(data)
             wbuf = file_context._wbuf
-            flush_size = self._smb.write_size
+            flush_size = self._write_flush_size
 
             if wbuf and offset == file_context._wbuf_offset + len(wbuf):
                 wbuf.extend(data)

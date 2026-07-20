@@ -91,7 +91,8 @@ class SMBClient:
         self._tree = TreeConnect(self._session, unc)
         self._tree.connect(require_secure_negotiate=False)
 
-        credits_needed = max(self.read_size, self.write_size) // 65536 + 16
+        credits_per_op = max(self.read_size, self.write_size) // 65536
+        credits_needed = credits_per_op * 4 + 32
         granted = self._connection.echo(
             sid=self._session.session_id, credit_request=credits_needed)
         sw = self._connection.sequence_window
@@ -266,12 +267,30 @@ class SMBClient:
                 lambda: self._write_file(file_open, data, offset))
 
     def _write_file(self, file_open, data, offset):
-        max_size = self._connection.max_write_size
+        chunk_size = min(self.write_size, self._connection.max_write_size)
+        chunks = []
+        pos = 0
+        while pos < len(data):
+            end = min(pos + chunk_size, len(data))
+            chunks.append((data[pos:end], offset + pos))
+            pos = end
+
+        if len(chunks) <= 1:
+            return file_open.write(chunks[0][0], chunks[0][1]) if chunks else 0
+
+        pending = []
+        sid = file_open.tree_connect.session.session_id
+        tid = file_open.tree_connect.tree_connect_id
+        credits_per = chunk_size // 65536
+        for chunk_data, chunk_offset in chunks:
+            msg, recv_func = file_open.write(chunk_data, chunk_offset, send=False)
+            request = self._connection.send(
+                msg, sid, tid, credit_request=credits_per)
+            pending.append((request, recv_func))
+
         total = 0
-        while total < len(data):
-            chunk = data[total:total + max_size]
-            written = file_open.write(chunk, offset + total)
-            total += written
+        for request, recv_func in pending:
+            total += recv_func(request)
         return total
 
     def set_delete_on_close(self, file_open):
