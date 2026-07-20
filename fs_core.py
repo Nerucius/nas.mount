@@ -16,9 +16,11 @@ Conventions:
 """
 
 import time
+import bisect
 import logging
 import threading
 from enum import Enum, auto
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
 from smbprotocol.exceptions import (
@@ -125,8 +127,8 @@ class FileHandle:
                  "file_attributes", "file_size", "allocation_size",
                  "creation_time", "last_access_time", "last_write_time",
                  "change_time", "io_lock",
-                 "ra_buf", "ra_start", "ra_futures", "seq_end",
-                 "writer", "co_buf", "co_off", "delete_pending", "dirty")
+                 "ra_windows", "ra_futures",
+                 "writer", "wsegs", "delete_pending", "dirty")
 
     def __init__(self, path, smb_path, smb_open=None, is_directory=False,
                  file_attributes=0, file_size=0, allocation_size=0,
@@ -146,15 +148,18 @@ class FileHandle:
         # Serializes read/write state per handle. Held across network waits;
         # concurrency across *different* files is what matters for throughput.
         self.io_lock = threading.Lock()
-        # Read-ahead state: current window + in-flight window futures.
-        self.ra_buf = None
-        self.ra_start = 0
-        self.ra_futures = {}  # window_start -> Future(bytes)
-        self.seq_end = -1     # end offset of last read (sequential detection)
-        # Write-behind state: coalescing buffer + pipelined writer.
+        # Read-ahead state: LRU of completed windows + in-flight futures.
+        # Kernel clients (macOS NFS especially) interleave their own
+        # readahead with stream reads, so nearby reads arrive out of order;
+        # keeping several completed windows makes that pattern all-hits.
+        self.ra_windows = OrderedDict()  # window_start -> bytes (LRU)
+        self.ra_futures = {}             # window_start -> Future(bytes)
+        # Write-behind state: out-of-order-tolerant segment coalescer +
+        # pipelined writer. Kernel clients (NFS writeback, overlapped I/O)
+        # deliver writes out of order; segments absorb that and only full
+        # write_size chunks go on the wire.
         self.writer = None
-        self.co_buf = bytearray()
-        self.co_off = 0
+        self.wsegs = []  # sorted [offset, bytearray], non-overlapping
         self.delete_pending = False
         self.dirty = False
 
@@ -171,8 +176,8 @@ class FileHandle:
         }
 
     def has_pending_writes(self):
-        return bool(self.co_buf) or (self.writer is not None
-                                     and self.writer.in_flight > 0)
+        return bool(self.wsegs) or (self.writer is not None
+                                    and self.writer.in_flight > 0)
 
 
 class FsCore:
@@ -463,25 +468,74 @@ class FsCore:
 
     # -- write-behind plumbing (call with handle.io_lock held) --
 
+    def _coalesce_insert(self, handle, offset, data):
+        """Insert a write into the sorted segment list, merging any
+        overlapping or adjacent segments (new data wins on overlap)."""
+        segs = handle.wsegs
+        new_start = offset
+        new_end = offset + len(data)
+        lo = bisect.bisect_left(segs, new_start, key=lambda s: s[0])
+        # A predecessor can touch/overlap us.
+        if lo > 0 and segs[lo - 1][0] + len(segs[lo - 1][1]) >= new_start:
+            lo -= 1
+        hi = lo
+        while hi < len(segs) and segs[hi][0] <= new_end:
+            hi += 1
+        if lo == hi:
+            segs.insert(lo, [offset, bytearray(data)])
+            return
+        span_start = min(new_start, segs[lo][0])
+        span_end = max(new_end, max(s[0] + len(s[1]) for s in segs[lo:hi]))
+        merged = bytearray(span_end - span_start)
+        for s_off, s_data in segs[lo:hi]:
+            merged[s_off - span_start:s_off - span_start + len(s_data)] = s_data
+        merged[new_start - span_start:new_start - span_start + len(data)] = data
+        segs[lo:hi] = [[span_start, merged]]
+
+    def _submit_full_chunks(self, handle):
+        """Send every full write_size multiple sitting in the segments;
+        keep the remainders coalescing."""
+        write_size = self._smb.write_size
+        if handle.writer is None:
+            handle.writer = self._smb.make_writer(handle.smb_open)
+        segs = handle.wsegs
+        i = 0
+        while i < len(segs):
+            s_off, s_data = segs[i]
+            if len(s_data) >= write_size:
+                n_full = (len(s_data) // write_size) * write_size
+                handle.writer.submit(bytes(s_data[:n_full]), s_off)
+                rest = s_data[n_full:]
+                if rest:
+                    segs[i] = [s_off + n_full, rest]
+                    i += 1
+                else:
+                    segs.pop(i)
+            else:
+                i += 1
+
+    def _buffered_bytes(self, handle):
+        return sum(len(s[1]) for s in handle.wsegs)
+
     def _drain_writes(self, handle):
-        """Push out the coalescing buffer and wait for all in-flight
+        """Push out all buffered segments and wait for all in-flight
         writes. Raises on write failure so callers can surface it."""
         if handle.smb_open is None:
             return
-        if handle.co_buf:
-            data = bytes(handle.co_buf)
-            offset = handle.co_off
-            handle.co_buf = bytearray()
+        if handle.wsegs:
             if handle.writer is None:
                 handle.writer = self._smb.make_writer(handle.smb_open)
-            handle.writer.submit(data, offset)
+            segs = handle.wsegs
+            handle.wsegs = []
+            for s_off, s_data in segs:
+                handle.writer.submit(bytes(s_data), s_off)
         if handle.writer is not None:
             handle.writer.drain()
 
     def _discard_writes(self, handle):
-        """Drop the coalescing buffer; still waits out in-flight requests
+        """Drop buffered segments; still waits out in-flight requests
         (protocol responses must be collected) but ignores errors."""
-        handle.co_buf = bytearray()
+        handle.wsegs = []
         if handle.writer is not None:
             try:
                 handle.writer.drain()
@@ -500,35 +554,44 @@ class FsCore:
             return b""
         return self._smb.read_file_pipelined(handle.smb_open, wstart, wlen)
 
+    def _window_cache_cap(self):
+        # Enough completed windows that a kernel client interleaving its
+        # own readahead with stream reads never bounces a window out while
+        # it is still being consumed.
+        return self._readahead_windows + 2
+
     def _ensure_prefetch(self, handle, wstart):
         """Schedule a background fetch of the window at wstart if not
-        already current, in flight, or past EOF."""
+        already cached, in flight, or past EOF."""
         if wstart >= handle.file_size:
             return
-        if handle.ra_buf is not None and wstart == handle.ra_start:
+        if wstart in handle.ra_windows:
             return
         if wstart in handle.ra_futures:
             return
         handle.ra_futures[wstart] = self._executor.submit(
             self._fetch_window, handle, wstart)
 
-    def _promote_window(self, handle, wstart):
-        """Make the window at wstart current, waiting on its future or
-        fetching it synchronously."""
+    def _get_window(self, handle, wstart):
+        """Return the window's bytes: LRU cache hit, in-flight future, or
+        synchronous fetch. Completed windows enter the LRU (old ones age
+        out - no purging, so out-of-order nearby reads always hit)."""
+        cached = handle.ra_windows.get(wstart)
+        if cached is not None:
+            handle.ra_windows.move_to_end(wstart)
+            return cached
         fut = handle.ra_futures.pop(wstart, None)
         if fut is not None:
             data = fut.result()
         else:
             data = self._fetch_window(handle, wstart)
-        handle.ra_buf = data
-        handle.ra_start = wstart
-        # Windows before the current one are stale.
-        for k in [k for k in handle.ra_futures if k <= wstart]:
-            handle.ra_futures.pop(k)
+        handle.ra_windows[wstart] = data
+        while len(handle.ra_windows) > self._window_cache_cap():
+            handle.ra_windows.popitem(last=False)
         return data
 
     def _drop_readahead(self, handle, wait=False):
-        handle.ra_buf = None
+        handle.ra_windows = OrderedDict()
         futures = handle.ra_futures
         handle.ra_futures = {}
         for fut in futures.values():
@@ -544,17 +607,15 @@ class FsCore:
                         pass
 
     def _read_from_windows(self, handle, offset, length):
-        """Assemble `length` bytes starting at offset from the current
-        window chain, promoting/prefetching as needed."""
+        """Assemble `length` bytes starting at offset from cached/fetched
+        windows, keeping the prefetch pipeline primed."""
         wsize = self._window_size()
         out = bytearray()
         pos = offset
         end = offset + length
         while pos < end:
             wstart = (pos // wsize) * wsize
-            if not (handle.ra_buf is not None and handle.ra_start == wstart):
-                self._promote_window(handle, wstart)
-            buf = handle.ra_buf
+            buf = self._get_window(handle, wstart)
             rel = pos - wstart
             if rel >= len(buf):
                 break  # EOF or short read from server
@@ -584,15 +645,7 @@ class FsCore:
                 if handle.has_pending_writes():
                     self._drain_writes(handle)
 
-                sequential = (offset == handle.seq_end
-                              or (handle.ra_buf is not None
-                                  and handle.ra_start <= offset
-                                  < handle.ra_start + len(handle.ra_buf)))
-                if not sequential:
-                    # Random seek: throw away stale windows.
-                    self._drop_readahead(handle)
                 data = self._read_from_windows(handle, offset, length)
-                handle.seq_end = offset + len(data)
                 if not data:
                     raise FsError(ErrorCode.END_OF_FILE)
                 return data
@@ -624,30 +677,20 @@ class FsCore:
                 if length == 0:
                     return 0
 
-                if handle.writer is None:
-                    handle.writer = self._smb.make_writer(handle.smb_open)
-
-                write_size = self._smb.write_size
-                if handle.co_buf and offset == handle.co_off + len(handle.co_buf):
-                    handle.co_buf.extend(data)
-                else:
-                    if handle.co_buf:
-                        # Non-sequential write: push out what we have.
-                        pending = bytes(handle.co_buf)
-                        poff = handle.co_off
-                        handle.co_buf = bytearray()
-                        handle.writer.submit(pending, poff)
-                    handle.co_buf = bytearray(data)
-                    handle.co_off = offset
-
-                # Feed full chunks into the pipeline, keep the remainder
+                self._coalesce_insert(handle, offset, data)
+                # Feed full chunks into the pipeline, keep remainders
                 # coalescing. submit() applies backpressure when the
                 # window is full, pacing us at network speed.
-                while len(handle.co_buf) >= write_size:
-                    chunk = bytes(handle.co_buf[:write_size])
-                    handle.writer.submit(chunk, handle.co_off)
-                    handle.co_buf = handle.co_buf[write_size:]
-                    handle.co_off += write_size
+                self._submit_full_chunks(handle)
+                # Progress/memory guarantee: if reordering leaves lots of
+                # partial segments behind, push the oldest ones out even
+                # though they're not full chunks.
+                write_size = self._smb.write_size
+                max_buffered = write_size * 3
+                while (self._buffered_bytes(handle) > max_buffered
+                       and handle.wsegs):
+                    s_off, s_data = handle.wsegs.pop(0)
+                    handle.writer.submit(bytes(s_data), s_off)
 
                 new_end = offset + length
                 if new_end > handle.file_size:
@@ -666,12 +709,20 @@ class FsCore:
                       handle.path, offset, len(buffer), e)
             map_smb_error(e)
 
-    def flush(self, handle):
+    def flush(self, handle, sync_disk=True):
+        """Drain buffered writes to the server. sync_disk additionally
+        issues SMB FLUSH (sync to stable storage) - wanted for explicit
+        Windows FlushFileBuffers, skipped for NFS COMMIT semantics where
+        data-at-the-server suffices and per-commit disk syncs would stall
+        the pipeline."""
         if handle.smb_open is not None:
             try:
                 with handle.io_lock:
                     self._drain_writes(handle)
-                self._smb.flush_file(handle.smb_open)
+                # SMB FLUSH needs write access; skip it on read-only
+                # handles (nothing to flush anyway).
+                if sync_disk and handle.dirty:
+                    self._smb.flush_file(handle.smb_open)
             except FsError:
                 raise
             except Exception as e:

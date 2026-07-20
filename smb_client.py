@@ -243,10 +243,17 @@ class SMBClient:
         try:
             return fn()
         except CONNECTION_ERRORS as e:
-            log.warning("Connection lost (%s), attempting reconnect", e)
+            log.warning("Connection lost (%s), checking connection", e)
             with self._state_lock:
                 # Single-flight: only reconnect if nobody else already did.
-                if self._connection is failed_conn:
+                if self._connection is not failed_conn:
+                    raise
+                # Ops on handles from a previous connection raise the same
+                # errors; don't tear down a healthy connection for them.
+                try:
+                    self._connection.echo(sid=self._session.session_id)
+                    log.info("Connection is healthy (stale handle error)")
+                except Exception:
                     self._reconnect()
             raise
 

@@ -4,6 +4,7 @@ this layer translates POSIX conventions - errno errors, epoch timestamps,
 slash paths, direct unlink instead of delete-on-close."""
 
 import os
+import time
 import stat as stat_m
 import errno
 import logging
@@ -54,7 +55,27 @@ def _raise_errno(err: FsError):
     raise FuseOSError(_ERRNO_MAP.get(err.code, errno.EIO))
 
 
+class _SinkFile:
+    """In-memory stand-in for AppleDouble/.DS_Store junk files. macOS NFS
+    has no xattr path, so the client writes ._* AppleDouble files; Samba
+    fruit vetoes those names and cp/Finder copies fail. We pretend to
+    store them and never touch the wire."""
+    __slots__ = ("path", "data", "mtime")
+
+    def __init__(self, path):
+        self.path = path
+        self.data = bytearray()
+        self.mtime = time.time()
+
+
+def _is_junk(wpath):
+    name = wpath.rsplit("\\", 1)[-1]
+    return name.startswith("._") or name == ".DS_Store"
+
+
 class SmbMacOperations(Operations):
+
+    MAX_SINK_FILES = 512
 
     def __init__(self, smb_client, subpath="", dir_cache_ttl=300,
                  readahead_windows=2, readahead_workers=8, volume_label="NAS"):
@@ -64,10 +85,12 @@ class SmbMacOperations(Operations):
             readahead_workers=readahead_workers, volume_label=volume_label)
         self._uid = os.getuid()
         self._gid = os.getgid()
-        self._handles = {}          # fh int -> FileHandle
+        self._handles = {}          # fh int -> FileHandle | _SinkFile
         self._by_path = {}          # win path -> set of open fh ints
         self._table_lock = threading.Lock()
         self._next_fh = 1
+        self._sink = {}             # win path -> _SinkFile
+        self._sink_lock = threading.Lock()
 
     # -- helpers --
 
@@ -125,10 +148,38 @@ class SmbMacOperations(Operations):
             "st_gid": self._gid,
         }
 
+    def _sink_get(self, wpath):
+        with self._sink_lock:
+            return self._sink.get(wpath)
+
+    def _sink_put(self, wpath):
+        with self._sink_lock:
+            sf = self._sink.get(wpath)
+            if sf is None:
+                sf = _SinkFile(wpath)
+                self._sink[wpath] = sf
+                while len(self._sink) > self.MAX_SINK_FILES:
+                    self._sink.pop(next(iter(self._sink)))
+            return sf
+
+    def _sink_stat(self, sf):
+        return {
+            "st_mode": stat_m.S_IFREG | 0o644,
+            "st_size": len(sf.data),
+            "st_ctime": sf.mtime, "st_mtime": sf.mtime, "st_atime": sf.mtime,
+            "st_birthtime": sf.mtime,
+            "st_nlink": 1, "st_uid": self._uid, "st_gid": self._gid,
+        }
+
     # -- metadata --
 
     def getattr(self, path, fh=None):
         wpath = self._p(path)
+        if _is_junk(wpath):
+            sf = self._sink_get(wpath)
+            if sf is None:
+                raise FuseOSError(errno.ENOENT)
+            return self._sink_stat(sf)
         if fh is not None:
             handle = self._get(fh)
             return self._stat_from_info(
@@ -148,6 +199,11 @@ class SmbMacOperations(Operations):
             info = self.core.lookup_or_stat(wpath)
         except FsError as e:
             _raise_errno(e)
+        except FuseOSError:
+            raise
+        except Exception as e:
+            log.error("getattr(%s) failed: %s", path, e)
+            raise FuseOSError(errno.EIO)
         if info is None:
             raise FuseOSError(errno.ENOENT)
         return self._stat_from_info(
@@ -161,6 +217,11 @@ class SmbMacOperations(Operations):
             entries = self.core.list_dir(self.core.to_smb_path(wpath))
         except FsError as e:
             _raise_errno(e)
+        except FuseOSError:
+            raise
+        except Exception as e:
+            log.error("readdir(%s) failed: %s", path, e)
+            raise FuseOSError(errno.EIO)
         return [".", ".."] + [e["file_name"] for e in entries]
 
     def statfs(self, path):
@@ -183,6 +244,15 @@ class SmbMacOperations(Operations):
 
     def open(self, path, flags):
         wpath = self._p(path)
+        if _is_junk(wpath):
+            sf = self._sink_get(wpath)
+            if sf is None:
+                if not (flags & os.O_CREAT):
+                    raise FuseOSError(errno.ENOENT)
+                sf = self._sink_put(wpath)
+            if flags & os.O_TRUNC:
+                sf.data = bytearray()
+            return self._register(sf)
         want_write = bool(flags & _WRITE_FLAGS)
         try:
             handle = self.core.open_handle(wpath, want_write)
@@ -194,6 +264,10 @@ class SmbMacOperations(Operations):
 
     def create(self, path, mode, fi=None):
         wpath = self._p(path)
+        if _is_junk(wpath):
+            sf = self._sink_put(wpath)
+            sf.data = bytearray()
+            return self._register(sf)
         try:
             handle = self.core.create_handle(wpath, is_dir=False)
         except FsError as e:
@@ -202,7 +276,7 @@ class SmbMacOperations(Operations):
 
     def release(self, path, fh):
         handle = self._unregister(fh)
-        if handle is not None:
+        if handle is not None and not isinstance(handle, _SinkFile):
             try:
                 self.core.close_handle(handle)
             except Exception as e:
@@ -213,6 +287,8 @@ class SmbMacOperations(Operations):
 
     def read(self, path, size, offset, fh):
         handle = self._get(fh)
+        if isinstance(handle, _SinkFile):
+            return bytes(handle.data[offset:offset + size])
         try:
             return self.core.read(handle, offset, size)
         except FsError as e:
@@ -222,6 +298,13 @@ class SmbMacOperations(Operations):
 
     def write(self, path, data, offset, fh):
         handle = self._get(fh)
+        if isinstance(handle, _SinkFile):
+            buf = handle.data
+            if len(buf) < offset:
+                buf.extend(b"\x00" * (offset - len(buf)))
+            buf[offset:offset + len(data)] = data
+            handle.mtime = time.time()
+            return len(data)
         try:
             return self.core.write(handle, data, offset)
         except FsError as e:
@@ -229,6 +312,12 @@ class SmbMacOperations(Operations):
 
     def truncate(self, path, length, fh=None):
         wpath = self._p(path)
+        if _is_junk(wpath):
+            sf = self._sink_get(wpath) or self._sink_put(wpath)
+            del sf.data[length:]
+            if len(sf.data) < length:
+                sf.data.extend(b"\x00" * (length - len(sf.data)))
+            return 0
         if fh is not None:
             handle = self._get(fh)
             try:
@@ -254,9 +343,13 @@ class SmbMacOperations(Operations):
         return 0
 
     def flush(self, path, fh):
+        # NFS COMMIT: data must reach the server; per-commit disk syncs
+        # would stall the write pipeline every few MB.
         handle = self._get(fh)
+        if isinstance(handle, _SinkFile):
+            return 0
         try:
-            self.core.flush(handle)
+            self.core.flush(handle, sync_disk=False)
         except FsError as e:
             _raise_errno(e)
         return 0
@@ -268,6 +361,11 @@ class SmbMacOperations(Operations):
 
     def unlink(self, path):
         wpath = self._p(path)
+        if _is_junk(wpath):
+            with self._sink_lock:
+                if self._sink.pop(wpath, None) is None:
+                    raise FuseOSError(errno.ENOENT)
+            return 0
         try:
             self.core.delete_path(wpath, is_dir=False)
         except FsError as e:
@@ -293,6 +391,14 @@ class SmbMacOperations(Operations):
 
     def rename(self, old, new):
         wold, wnew = self._p(old), self._p(new)
+        if _is_junk(wold) or _is_junk(wnew):
+            with self._sink_lock:
+                sf = self._sink.pop(wold, None)
+            if _is_junk(wnew) and sf is not None:
+                sf.path = wnew
+                with self._sink_lock:
+                    self._sink[wnew] = sf
+            return 0
         handle = self._open_handle_for_path(wold)
         try:
             self.core.rename(handle, wold, wnew, replace_if_exists=True)
@@ -311,7 +417,9 @@ class SmbMacOperations(Operations):
     def utimens(self, path, times=None):
         return 0
 
-    # -- xattrs: refuse fast so Finder doesn't generate SMB traffic --
+    # -- xattrs: accept and drop, never hit the wire. Refusing (ENOTSUP)
+    # makes cp/Finder copies fail; quarantine flags and Finder tags are
+    # meaningless on the NAS anyway. --
 
     def getxattr(self, path, name, position=0):
         raise FuseOSError(errno.ENODATA)
@@ -320,10 +428,10 @@ class SmbMacOperations(Operations):
         return []
 
     def setxattr(self, path, name, value, options, position=0):
-        raise FuseOSError(errno.ENOTSUP)
+        return 0
 
     def removexattr(self, path, name):
-        raise FuseOSError(errno.ENODATA)
+        return 0
 
 
 def mount_macos(ops, mountpoint, volume_label, foreground=True, debug=False):
@@ -338,6 +446,8 @@ def mount_macos(ops, mountpoint, volume_label, foreground=True, debug=False):
         "daemon_timeout": 600,
         # Kill AppleDouble ._* traffic at the source.
         "noappledouble": True,
+        # Bigger NFS transfer size: fewer, larger callbacks (default 32K).
+        "rwsize": 1048576,
     }
     if debug:
         kwargs["debug"] = True
