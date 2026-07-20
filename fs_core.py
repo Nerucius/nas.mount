@@ -33,6 +33,7 @@ log = logging.getLogger(__name__)
 EPOCH_AS_FILETIME = 116444736000000000  # 1601-01-01 in 100ns ticks
 
 FILE_ATTRIBUTE_DIRECTORY = 0x10
+FILE_ATTRIBUTE_HIDDEN = 0x02
 FILE_ATTRIBUTE_NORMAL = 0x80
 
 STATUS_FILE_IS_A_DIRECTORY = 0xC00000BA
@@ -60,6 +61,9 @@ def smb_dt_to_filetime(dt):
 def normalize_attrs(smb_attrs):
     if smb_attrs & FILE_ATTRIBUTE_DIRECTORY:
         return smb_attrs
+    # Samba maps Unix dotfiles to HIDDEN; strip it so WinFsp allows
+    # FILE_OVERWRITE_IF without the caller specifying HIDDEN.
+    smb_attrs &= ~FILE_ATTRIBUTE_HIDDEN
     if smb_attrs == 0:
         return FILE_ATTRIBUTE_NORMAL
     return smb_attrs
