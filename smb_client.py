@@ -20,11 +20,16 @@ from smbprotocol.open import (
 from smbprotocol.file_info import (
     FileAttributes,
     FileInformationClass,
+    FileSystemInformationClass,
+    FileFsFullSizeInformation,
     FileDispositionInformation,
     FileEndOfFileInformation,
     FileRenameInformation,
 )
-from smbprotocol.open import SMB2SetInfoRequest, SMB2SetInfoResponse
+from smbprotocol.open import (
+    SMB2SetInfoRequest, SMB2SetInfoResponse,
+    SMB2QueryInfoRequest, SMB2QueryInfoResponse,
+)
 from smbprotocol.exceptions import (
     SMBConnectionClosed,
     SMBException,
@@ -391,6 +396,48 @@ class SMBClient:
         finally:
             try:
                 file_open.close()
+            except Exception:
+                pass
+
+    def query_volume_info(self):
+        return self._with_reconnect(self._query_volume_info)
+
+    def _query_volume_info(self):
+        dir_open = Open(self._tree, "")
+        try:
+            dir_open.create(
+                ImpersonationLevel.Impersonation,
+                DirectoryAccessMask.FILE_READ_ATTRIBUTES,
+                FileAttributes.FILE_ATTRIBUTE_DIRECTORY,
+                ShareAccess.FILE_SHARE_READ,
+                CreateDisposition.FILE_OPEN,
+                CreateOptions.FILE_DIRECTORY_FILE,
+            )
+            info = FileFsFullSizeInformation()
+            req = SMB2QueryInfoRequest()
+            req["info_type"] = info.INFO_TYPE
+            req["file_info_class"] = info.INFO_CLASS
+            req["file_id"] = dir_open.file_id
+            req["output_buffer_length"] = 56
+            request = dir_open.connection.send(
+                req, dir_open.tree_connect.session.session_id,
+                dir_open.tree_connect.tree_connect_id)
+            response = dir_open.connection.receive(request)
+            resp = SMB2QueryInfoResponse()
+            resp.unpack(response["data"].get_value())
+            info.unpack(resp["buffer"].get_value())
+            units_total = info["total_allocation_units"].get_value()
+            units_free = info["caller_available_units"].get_value()
+            sectors = info["sectors_per_unit"].get_value()
+            bps = info["bytes_per_sector"].get_value()
+            block = sectors * bps
+            return {
+                "total_size": units_total * block,
+                "free_size": units_free * block,
+            }
+        finally:
+            try:
+                dir_open.close()
             except Exception:
                 pass
 

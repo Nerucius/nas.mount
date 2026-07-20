@@ -107,7 +107,7 @@ class SmbFileContext:
 class SmbFileSystemOperations(BaseFileSystemOperations):
 
     def __init__(self, smb_client, subpath="", dir_cache_ttl=300,
-                 readahead_windows=2, readahead_workers=8):
+                 readahead_windows=2, readahead_workers=8, volume_label="NAS"):
         super().__init__()
         self._smb = smb_client
         self._subpath = subpath.replace("/", "\\")
@@ -115,6 +115,9 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
         self._dir_cache = {}
         self._cache_lock = threading.Lock()
         self._readahead_windows = readahead_windows
+        self._volume_label = volume_label
+        self._vol_info = None
+        self._vol_info_ts = 0
         self._executor = ThreadPoolExecutor(
             max_workers=readahead_workers, thread_name_prefix="readahead")
 
@@ -353,10 +356,22 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
     # -- WinFsp callbacks --
 
     def get_volume_info(self):
+        now = time.monotonic()
+        if self._vol_info is None or (now - self._vol_info_ts) > 60:
+            try:
+                self._vol_info = self._smb.query_volume_info()
+                self._vol_info_ts = now
+            except Exception as e:
+                log.debug("query_volume_info failed: %s", e)
+                if self._vol_info is None:
+                    self._vol_info = {
+                        "total_size": 1 * 1024 * 1024 * 1024 * 1024,
+                        "free_size": 500 * 1024 * 1024 * 1024,
+                    }
         return {
-            "total_size": 1 * 1024 * 1024 * 1024 * 1024,
-            "free_size": 500 * 1024 * 1024 * 1024,
-            "volume_label": "NAS",
+            "total_size": self._vol_info["total_size"],
+            "free_size": self._vol_info["free_size"],
+            "volume_label": self._volume_label,
         }
 
     def get_security_by_name(self, file_name):

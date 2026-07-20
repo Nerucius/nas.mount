@@ -253,6 +253,7 @@ def run_test(config):
 
 def parse_mount_config(config):
     mounts = config.get("mounts", {})
+    labels = config.get("labels", {})
     share_names = set()
     result = []
     for drive, share_path in mounts.items():
@@ -260,7 +261,9 @@ def parse_mount_config(config):
         share_name = parts[0]
         subpath = parts[1] if len(parts) > 1 else ""
         share_names.add(share_name)
-        result.append({"drive": drive, "share_name": share_name, "subpath": subpath})
+        label = labels.get(drive, subpath.capitalize() if subpath else share_name)
+        result.append({"drive": drive, "share_name": share_name,
+                        "subpath": subpath, "label": label})
     if len(share_names) > 1:
         log.warning("Multiple share names detected: %s. Each unique share needs "
                     "its own SMB connection.", share_names)
@@ -303,6 +306,7 @@ def run_mount(config, debug=False):
                 dir_cache_ttl=tuning.get("dir_cache_ttl", 300),
                 readahead_windows=tuning.get("readahead_windows", 2),
                 readahead_workers=tuning.get("readahead_workers", 8),
+                volume_label=mc["label"],
             )
 
             mountpoint = f"{drive}:"

@@ -19,3 +19,8 @@ max_reconnect_attempts = 10
 M = "storage/media"
 Y = "storage/documents"
 Z = "storage/backups"
+
+[labels]
+M = "TrueNAS Media"
+Y = "TrueNAS Documents"
+Z = "TrueNAS Backups"
