@@ -11,6 +11,7 @@ read_pipeline_depth = 3    # concurrent read requests in flight per stream
 write_pipeline_depth = 4   # concurrent write requests in flight per file
 readahead_windows = 2      # background prefetch windows per file
 readahead_workers = 8      # shared prefetch thread pool size
+write_buffer_chunks = 3    # coalescer pressure limit, in write_size units
 dir_cache_ttl = 300        # directory listing cache in seconds
 reconnect_delay = 5        # seconds before reconnect attempt
 max_reconnect_attempts = 10
@@ -27,6 +28,8 @@ Z = "TrueNAS Backups"
 
 [macos]
 mount_root = "~/nas"     # each mount lands at <mount_root>/<subpath basename>
+rwsize = 1048576         # FUSE-T NFS transfer size (default 32K without this)
+daemon_timeout = 600     # seconds before the kernel force-ejects a slow volume
 # Optional explicit mountpoint overrides per drive key:
 # [macos.mounts]
 # M = "/Volumes/nas-media"

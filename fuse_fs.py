@@ -55,12 +55,15 @@ def _raise_nt(err: FsError):
 class SmbFileSystemOperations(BaseFileSystemOperations):
 
     def __init__(self, smb_client, subpath="", dir_cache_ttl=300,
-                 readahead_windows=2, readahead_workers=8, volume_label="NAS"):
+                 readahead_windows=2, readahead_workers=8,
+                 write_buffer_chunks=3, volume_label="NAS"):
         super().__init__()
         self.core = FsCore(
             smb_client, subpath=subpath, dir_cache_ttl=dir_cache_ttl,
             readahead_windows=readahead_windows,
-            readahead_workers=readahead_workers, volume_label=volume_label)
+            readahead_workers=readahead_workers,
+            write_buffer_chunks=write_buffer_chunks,
+            volume_label=volume_label)
 
     # -- WinFsp callbacks --
 

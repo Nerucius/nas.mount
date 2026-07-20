@@ -185,13 +185,15 @@ class FsCore:
     arguments/errors at their platform boundary."""
 
     def __init__(self, smb_client, subpath="", dir_cache_ttl=300,
-                 readahead_windows=2, readahead_workers=8, volume_label="NAS"):
+                 readahead_windows=2, readahead_workers=8,
+                 write_buffer_chunks=3, volume_label="NAS"):
         self._smb = smb_client
         self._subpath = subpath.replace("/", "\\")
         self._dir_cache_ttl = dir_cache_ttl
         self._dir_cache = {}
         self._cache_lock = threading.Lock()
         self._readahead_windows = readahead_windows
+        self._write_buffer_chunks = write_buffer_chunks
         self.volume_label = volume_label
         self._vol_info = None
         self._vol_info_ts = 0
@@ -472,6 +474,20 @@ class FsCore:
         """Insert a write into the sorted segment list, merging any
         overlapping or adjacent segments (new data wins on overlap)."""
         segs = handle.wsegs
+        # Fast path for sequential streams (the overwhelmingly common
+        # case): append in place to the tail segment - O(1) amortized, no
+        # realloc/copy of everything accumulated so far.
+        if not segs:
+            segs.append([offset, bytearray(data)])
+            return
+        last = segs[-1]
+        last_end = last[0] + len(last[1])
+        if offset == last_end:
+            last[1].extend(data)
+            return
+        if offset > last_end:
+            segs.append([offset, bytearray(data)])
+            return
         new_start = offset
         new_end = offset + len(data)
         lo = bisect.bisect_left(segs, new_start, key=lambda s: s[0])
@@ -686,7 +702,7 @@ class FsCore:
                 # partial segments behind, push the oldest ones out even
                 # though they're not full chunks.
                 write_size = self._smb.write_size
-                max_buffered = write_size * 3
+                max_buffered = write_size * self._write_buffer_chunks
                 while (self._buffered_bytes(handle) > max_buffered
                        and handle.wsegs):
                     s_off, s_data = handle.wsegs.pop(0)

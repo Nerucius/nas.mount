@@ -78,11 +78,14 @@ class SmbMacOperations(Operations):
     MAX_SINK_FILES = 512
 
     def __init__(self, smb_client, subpath="", dir_cache_ttl=300,
-                 readahead_windows=2, readahead_workers=8, volume_label="NAS"):
+                 readahead_windows=2, readahead_workers=8,
+                 write_buffer_chunks=3, volume_label="NAS"):
         self.core = FsCore(
             smb_client, subpath=subpath, dir_cache_ttl=dir_cache_ttl,
             readahead_windows=readahead_windows,
-            readahead_workers=readahead_workers, volume_label=volume_label)
+            readahead_workers=readahead_workers,
+            write_buffer_chunks=write_buffer_chunks,
+            volume_label=volume_label)
         self._uid = os.getuid()
         self._gid = os.getgid()
         self._handles = {}          # fh int -> FileHandle | _SinkFile
@@ -434,7 +437,8 @@ class SmbMacOperations(Operations):
         return 0
 
 
-def mount_macos(ops, mountpoint, volume_label, foreground=True, debug=False):
+def mount_macos(ops, mountpoint, volume_label, foreground=True, debug=False,
+                rwsize=1048576, daemon_timeout=600):
     """Mount one share; blocks until unmounted (run in a thread per mount)."""
     os.makedirs(mountpoint, exist_ok=True)
     kwargs = {
@@ -443,11 +447,11 @@ def mount_macos(ops, mountpoint, volume_label, foreground=True, debug=False):
         "fsname": "nas-mount",
         "volname": volume_label,
         # WAN operations can be slow; don't let the kernel force-eject.
-        "daemon_timeout": 600,
+        "daemon_timeout": daemon_timeout,
         # Kill AppleDouble ._* traffic at the source.
         "noappledouble": True,
         # Bigger NFS transfer size: fewer, larger callbacks (default 32K).
-        "rwsize": 1048576,
+        "rwsize": rwsize,
     }
     if debug:
         kwargs["debug"] = True

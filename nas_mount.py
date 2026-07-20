@@ -309,6 +309,7 @@ def run_mount(config, debug=False):
                 dir_cache_ttl=tuning.get("dir_cache_ttl", 300),
                 readahead_windows=tuning.get("readahead_windows", 2),
                 readahead_workers=tuning.get("readahead_workers", 8),
+                write_buffer_chunks=tuning.get("write_buffer_chunks", 3),
                 volume_label=mc["label"],
             )
 
@@ -400,6 +401,7 @@ def run_mount_macos(config, debug=False):
                 dir_cache_ttl=tuning.get("dir_cache_ttl", 300),
                 readahead_windows=tuning.get("readahead_windows", 2),
                 readahead_workers=tuning.get("readahead_workers", 8),
+                write_buffer_chunks=tuning.get("write_buffer_chunks", 3),
                 volume_label=mc["label"],
             )
 
@@ -413,7 +415,11 @@ def run_mount_macos(config, debug=False):
             t = threading.Thread(
                 target=mount_macos,
                 args=(ops, mountpoint, mc["label"]),
-                kwargs={"debug": debug},
+                kwargs={
+                    "debug": debug,
+                    "rwsize": macos_cfg.get("rwsize", 1048576),
+                    "daemon_timeout": macos_cfg.get("daemon_timeout", 600),
+                },
                 name=f"fuse-{drive}",
                 daemon=True,
             )
