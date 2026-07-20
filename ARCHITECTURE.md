@@ -5,11 +5,24 @@
 Three files, five phases. A Python FUSE filesystem using WinFsp (via winfspy) and smbprotocol to mount remote TrueNAS SMB shares as Windows drive letters with 4 MB reads and pipelined writes.
 
 ```
-Windows App  →  WinFsp kernel driver  →  fuse_fs.py (callbacks)  →  smb_client.py (thread-safe)  →  SMB over WAN  →  TrueNAS
+Windows App  →  WinFsp kernel driver  →  fuse_fs.py (callbacks)  →  smb_client.py  →  SMB over WAN  →  socat @ gateway  →  TrueNAS
                                               ↑                          ↑
-                                     SmbFileSystemOperations       One lock per connection
-                                     (BaseFileSystemOperations)    serializes all SMB ops
+                                     SmbFileSystemOperations       concurrent ops (smbprotocol is
+                                     async read-ahead +            internally thread-safe); state
+                                     pipelined write-behind        lock only for connect/reconnect
 ```
+
+### Why the gateway proxy (socat) stays
+
+The WAN path client-site→local-site has burst-sensitive behavior that FreeBSD 13.1's
+base TCP stack (no RACK/pacing, TrueNAS CORE ships no alternative stack) handles
+terribly as a sender: measured 10 Mbps with ~28% retransmit storms, while a
+Linux sender achieves 77-92 Mbps with zero retransmits on the same path minute
+by minute (validated with iperf3 + packet captures, 2026-07-20). Kernel-level
+DNAT forwarding was tried and root-caused; split TCP at the gateway gives both
+WAN directions a modern Linux sender. socat runs as a systemd unit
+(`smb-relay.service`, 1 MB blocks, TCP_NODELAY, no explicit socket buffers so
+Linux autotuning stays active).
 
 ## File Responsibilities
 
@@ -21,16 +34,39 @@ Windows App  →  WinFsp kernel driver  →  fuse_fs.py (callbacks)  →  smb_cl
 
 ## Key Design Decisions
 
-- **Lock per connection** (not a queue/thread) — simpler, and the bottleneck is 37ms network RTT not lock contention
+- **Concurrent SMB ops, no global lock** — smbprotocol's Connection is internally
+  thread-safe (socket send lock, sequence/credit lock, dedicated receiver thread
+  with per-request events). A state lock only covers connect/disconnect, and
+  reconnects are single-flight.
+- **Pipelined reads** — `read_file_pipelined()` keeps `read_pipeline_depth`
+  (default 3) read requests in flight via `send=False`, so the pipe never
+  drains between 4 MB chunks. Measured at the full 100 Mbps line rate vs
+  87 Mbps for stop-and-go single requests.
+- **Async read-ahead** — per-file windows (window = read_size) prefetched by a
+  shared thread pool. Sequential readers cross the midpoint of a window and the
+  next `readahead_windows` windows are scheduled in the background; the
+  consumer never waits on the network in steady state. Random seeks drop the
+  window chain and fetch synchronously.
+- **Continuous write-behind** — WinFsp's ~1 MB writes coalesce into write_size
+  chunks and feed a per-handle `PipelinedWriter` holding `write_pipeline_depth`
+  (default 4) requests in flight. submit() blocks when the window is full
+  (backpressure), so memory stays bounded and the connection never idles
+  between chunks or batches. No fill-drain-fill stalls.
+- **Write/read consistency** — reads drain pending writes first; overwrite,
+  set_file_size and rename drain/discard coherently; `constrained_io` writes
+  never extend the file.
 - **No Python file content cache** — Windows kernel cache handles this when `file_info_timeout > 0`
 - **Dir cache with TTL** — simple dict, configurable TTL (default 300s), invalidated on create/delete/rename
 - **Fixed security descriptor** — "full access everyone" avoids translating SMB ACLs
 - **1:1 mapping** — each WinFsp `open()` creates one SMB Open handle, stored in `SmbFileContext`
 - **Path subpath support** — `M = "storage/media"` → share is `storage`, FUSE root is `media/` subdirectory
-- **Read-ahead buffer** — per-file 4 MB prefetch; small reads (mpv seeks) served from memory
-- **Write-behind buffer** — accumulates WinFsp's 1 MB writes into 16 MB batches before flushing
-- **Pipelined writes** — flush sends 4x 4 MB writes simultaneously via `send=False`, collects responses after. 2.76x faster than sequential at the raw SMB level
-- **Credit negotiation** — echo-request credits on connect; request replenishment with each pipelined write
+- **Cheap cold opens** — open() consults the dir cache only; on a miss it opens
+  the SMB handle directly (the create response carries all metadata) instead of
+  listing the whole parent directory first.
+- **Credit negotiation** — echo-request credits on connect until the pool covers
+  both pipelines; every pipelined request asks for replenishment; senders drain
+  in-flight responses when the sequence window runs low (smbprotocol raises
+  rather than blocks on credit exhaustion).
 
 ## SMB Client (smb_client.py)
 
@@ -65,12 +101,17 @@ On connect, an echo request with `credit_request = (write_size / 64KB) * 4 + 32`
 
 ### Write Pipelining
 
-`_write_file()` splits data into `write_size` chunks (4 MB default). If multiple chunks:
-1. Build each SMB2WriteRequest via `file_open.write(data, offset, send=False)`
-2. Send all requests via `connection.send()` with `credit_request` for replenishment
-3. Collect all responses via `recv_func(request)`
+`PipelinedWriter` (one per open handle) maintains a sliding window:
+1. `submit(data, offset)` splits into `write_size` chunks; each chunk is built
+   via `file_open.write(..., send=False)` and sent with a credit replenishment
+   request.
+2. When `write_pipeline_depth` requests are in flight, submit blocks collecting
+   the oldest response before sending the next chunk — a true sliding window,
+   not batch-and-drain, so there is no bubble between batches.
+3. `drain()` collects everything outstanding; errors surface to the caller.
 
-This overlaps network latency across chunks. At 37ms RTT, 4 pipelined writes complete in ~40ms total instead of ~150ms sequential.
+The FUSE write callback returns as soon as its chunk is queued, so the copy
+source keeps producing while the network transmits.
 
 ### Reconnection Strategy
 
@@ -82,7 +123,15 @@ Every public method wraps SMB calls in try/except for connection errors. On fail
 
 ### Thread Safety
 
-A single `threading.Lock` per `SMBClient` instance serializes all SMB operations. WinFsp's dispatcher has multiple threads, so concurrent callbacks serialize at the lock. Since the bottleneck is network RTT (37ms) not lock contention, this is adequate.
+smbprotocol's transport has its own socket send lock, the connection has a
+sequence/credit lock, and responses are demultiplexed by a dedicated receiver
+thread into per-request events — so SMB operations from multiple WinFsp
+dispatcher threads run concurrently without serializing at a client-wide lock.
+Streaming a movie no longer blocks Explorer metadata operations.
+
+Per-file read/write state is guarded by `SmbFileContext.io_lock`; the
+`SMBClient._state_lock` (RLock) covers connection lifecycle only, with
+single-flight reconnect.
 
 ## FUSE Filesystem (fuse_fs.py)
 

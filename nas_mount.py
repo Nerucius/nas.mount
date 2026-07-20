@@ -30,6 +30,8 @@ def build_client(config, share_name=None):
         share_name=share_name,
         read_size=tuning.get("read_size", 4 * 1024 * 1024),
         write_size=tuning.get("write_size", 4 * 1024 * 1024),
+        read_pipeline_depth=tuning.get("read_pipeline_depth", 3),
+        write_pipeline_depth=tuning.get("write_pipeline_depth", 4),
         reconnect_delay=tuning.get("reconnect_delay", 5),
         max_reconnect_attempts=tuning.get("max_reconnect_attempts", 10),
     )
@@ -119,12 +121,55 @@ def run_speed_test(client, file_path, file_size, read_sizes=None, test_bytes=Non
         label = format_size(read_size).rjust(12)
         print(f"  {label}  {format_speed(speed):>22}  {elapsed:>7.1f}s  {num_reads:>6}")
 
+    # Pipelined read: single sliding-window stream, the path the mount uses.
+    file_open = client.open_file(file_path, read=True)
+    try:
+        start = time.perf_counter()
+        data = client.read_file_pipelined(file_open, 0, test_bytes)
+        elapsed = time.perf_counter() - start
+    finally:
+        client.close_file(file_open)
+    speed = len(data) / elapsed if elapsed > 0 else 0
+    results.append(("pipelined", speed, elapsed, -1))
+    label = f"pipelined x{client.read_pipeline_depth}".rjust(12)
+    print(f"  {label}  {format_speed(speed):>22}  {elapsed:>7.1f}s  {'-':>6}")
+
     if len(results) >= 2:
         base_speed = results[0][1]
         best_speed = max(r[1] for r in results)
         if base_speed > 0:
             print(f"\n  Speedup vs 64KB: {best_speed / base_speed:.1f}x")
     return results
+
+
+def run_write_test(client, subpath, size_mb=64):
+    import os as _os
+    test_name = ".nas-mount-write-bench.tmp"
+    test_path = f"{subpath}\\{test_name}" if subpath else test_name
+    total = size_mb * 1024 * 1024
+    payload = _os.urandom(4 * 1024 * 1024)
+
+    print(f"\n  Write benchmark: {test_path} ({size_mb} MB, pipelined x{client.write_pipeline_depth})")
+    file_open = client.create_file(test_path)
+    try:
+        writer = client.make_writer(file_open)
+        written = 0
+        start = time.perf_counter()
+        while written < total:
+            n = min(len(payload), total - written)
+            writer.submit(payload[:n], written)
+            written += n
+        writer.drain()
+        elapsed = time.perf_counter() - start
+        speed = written / elapsed if elapsed > 0 else 0
+        print(f"  Wrote {format_size(written)} in {elapsed:.1f}s = {format_speed(speed)}")
+    finally:
+        client.close_file(file_open)
+        try:
+            client.delete_file(test_path)
+            print("  Test file deleted.")
+        except Exception as e:
+            print(f"  WARNING: could not delete test file: {e}")
 
 
 def run_test(config):
@@ -256,6 +301,8 @@ def run_mount(config, debug=False):
                 smb_client=client,
                 subpath=subpath,
                 dir_cache_ttl=tuning.get("dir_cache_ttl", 300),
+                readahead_windows=tuning.get("readahead_windows", 2),
+                readahead_workers=tuning.get("readahead_workers", 8),
             )
 
             mountpoint = f"{drive}:"
@@ -319,8 +366,10 @@ def main():
                         help="Test SMB connection and benchmark speed (no mount)")
     parser.add_argument("--bench", metavar="PATH",
                         help="Benchmark a specific file path (relative to share root)")
+    parser.add_argument("--bench-write", action="store_true",
+                        help="Benchmark upload speed with a temporary file")
     parser.add_argument("--bench-size", type=int, default=32,
-                        help="MB to read per test (default: 32)")
+                        help="MB to read/write per test (default: 32)")
     parser.add_argument("--drive", metavar="LETTER",
                         help="Mount only this drive letter (default: all)")
     args = parser.parse_args()
@@ -345,6 +394,16 @@ def main():
         stat = client.stat_path(args.bench)
         run_speed_test(client, args.bench, stat["end_of_file"],
                        test_bytes=args.bench_size * 1024 * 1024)
+        client.disconnect()
+        return
+
+    if args.bench_write:
+        client = build_client(config)
+        client.connect()
+        first_subpath = list(config["mounts"].values())[0].split("/", 1)
+        subpath = first_subpath[1] if len(first_subpath) > 1 else ""
+        run_write_test(client, subpath.replace("/", "\\"),
+                       size_mb=args.bench_size)
         client.disconnect()
         return
 

@@ -5,11 +5,14 @@ user = "herman"
 password = ""  # or set NAS_MOUNT_PASSWORD env var
 
 [tuning]
-read_size = 4194304      # 4 MB - read-ahead buffer, good for streaming
-write_size = 4194304     # 4 MB - sweet spot (8 MB is slower due to per-request latency)
-dir_cache_ttl = 300      # directory listing cache in seconds
-attr_cache_ttl = 60      # file attribute cache in seconds
-reconnect_delay = 5      # seconds before reconnect attempt
+read_size = 4194304        # 4 MB - SMB read request / read-ahead window size
+write_size = 4194304       # 4 MB - SMB write request size
+read_pipeline_depth = 3    # concurrent read requests in flight per stream
+write_pipeline_depth = 4   # concurrent write requests in flight per file
+readahead_windows = 2      # background prefetch windows per file
+readahead_workers = 8      # shared prefetch thread pool size
+dir_cache_ttl = 300        # directory listing cache in seconds
+reconnect_delay = 5        # seconds before reconnect attempt
 max_reconnect_attempts = 10
 
 [mounts]

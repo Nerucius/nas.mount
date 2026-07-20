@@ -14,8 +14,8 @@ A Python FUSE filesystem using WinFsp (via winfspy) and smbprotocol to mount rem
 
 ## Key constraints
 
-- **Single SMB connection per mount** - smbprotocol connections can drop on network blips. Reconnect logic with exponential backoff handles this.
-- **WinFsp callbacks run on arbitrary threads** - smbprotocol is not thread-safe per-connection. One `threading.Lock` per SMBClient serializes all SMB ops.
+- **Single SMB connection per mount** - smbprotocol connections can drop on network blips. Reconnect logic with exponential backoff handles this (single-flight across threads).
+- **WinFsp callbacks run on arbitrary threads** - smbprotocol's Connection IS internally thread-safe (socket send lock, sequence/credit lock, receiver thread with per-request events), so SMB ops run concurrently. Only connect/reconnect is serialized via a state lock; per-file buffer state is guarded by a per-context lock.
 - **Directory listing can be slow** - cache READDIR results with configurable TTL (default 300s). Invalidated on create/delete/rename.
 - **File metadata (size, dates) must be accurate** - Windows Explorer and media players rely on correct file sizes for seek/progress. Cached in SmbFileContext on open.
 - **SMB credits limit request sizes** - server grants credits incrementally. Client requests credits on connect via echo and with each pipelined write. 64 credits = 4 MB max per single request.
@@ -25,8 +25,8 @@ A Python FUSE filesystem using WinFsp (via winfspy) and smbprotocol to mount rem
 
 - One SMB `Connection` + `Session` + `TreeConnect` per unique share name. Multiple mounts to the same share reuse one connection.
 - File handles: WinFsp `open()`/`create()` returns `SmbFileContext` wrapping an smbprotocol `Open` object.
-- Read strategy: 4 MB read-ahead buffer per file. Small reads (e.g., mpv 64 KB seeks) served from buffer without SMB round-trips.
-- Write strategy: write-behind buffer accumulates WinFsp's 1 MB writes, flushes as 4x 4 MB pipelined SMB writes (16 MB batch). Reduces round-trips by ~16x.
+- Read strategy: pipelined reads (`read_pipeline_depth` in flight via `send=False`) + async read-ahead — a shared thread pool prefetches the next `readahead_windows` 4 MB windows while the consumer drains the current one. Small reads (mpv 64 KB seeks) served from memory; sequential streams never stall on the network.
+- Write strategy: WinFsp's ~1 MB writes coalesce into 4 MB chunks feeding a per-handle `PipelinedWriter` sliding window (`write_pipeline_depth` in flight). `submit()` applies backpressure when full; the connection never idles between chunks. Reads drain pending writes first (consistency).
 - Caching: directory entries cached in memory with TTL. File content is NOT cached (WinFsp's `file_info_timeout=1000` enables kernel caching).
 - Config: TOML file at `config.toml` in project root. Passwords can alternatively come from `NAS_MOUNT_PASSWORD` env var.
 
@@ -67,38 +67,49 @@ python nas_mount.py --test
 python nas_mount.py --bench media\somefile.mkv --bench-size 64
 ```
 
-## Proven benchmarks (from testing session 2026-07-18/20)
+## Proven benchmarks (raw smbprotocol from macOS over real WAN, 2026-07-20, ~41ms RTT)
 
-Read benchmarks (raw SMB via smbprotocol against example.org:3445, ~37ms RTT):
+Reads (line rate = client-site 100 Mbps uplink):
 
-| Read size | Speed | Notes |
+| Mode | Speed | Notes |
 |-----------|-------|-------|
-| 64 KB | 1.3 MB/s | rclone's hardcoded limit |
-| 256 KB | 4.0 MB/s | |
-| 1 MB | 7.0 MB/s | |
-| 4 MB | 10.7 MB/s | **Target** - 86% of line speed |
+| 64 KB single | 1.2 MB/s | rclone's hardcoded limit |
+| 4 MB single | 10.9 MB/s | old stop-and-go read path |
+| **4 MB pipelined x3** | **12.5 MB/s (100 Mbps)** | **new path - line rate, done** |
 
-Write benchmarks (through FUSE mount, 321 MB test file):
+Writes (ceiling: iperf3 measured 511-581 Mbps end-to-end):
 
 | Mode | Speed | Notes |
 |------|-------|-------|
-| Sequential (no buffer) | ~20 MB/s | 1 MB WinFsp chunks, one SMB write per chunk |
-| Write-behind 4 MB | 34-38 MB/s | Buffer + single flush |
-| Pipelined 4x4 MB | 42-51 MB/s | Write-behind + pipelined flush |
-| Raw pipelined (no FUSE) | 65 MB/s | Theoretical ceiling for 4x4 MB pipeline |
+| Old batch pipeline (Windows, FUSE) | 42-51 MB/s | fill-drain-fill stalls |
+| New sliding window (Mac, raw, 96 MB) | 40-48 MB/s | short-transfer TCP ramp dominates |
+| New sliding window (Mac, raw, 192 MB) | 57 MB/s (458 Mbps) | client CPU only 8-11% |
 
-Server-side Samba tuning (already applied on TrueNAS):
+Depth sweeps showed write_size=4MB/depth=4-6 is the sweet spot; deeper/larger doesn't help.
+SMB signing cannot be disabled client-side (Samba rejects unsigned TreeConnect).
+
+Server-side Samba tuning (applied on TrueNAS via midclt, persisted):
 ```
 smb2 max read = 8388608
 smb2 max write = 8388608
 smb2 max trans = 8388608
 smb2 max credits = 8192
+use sendfile = yes
+aio read size = 1
+aio write size = 1
+min receivefile size = 16384
 ```
+(`socket options` line REMOVED 2026-07-20 - it pinned 512 KB buffers and set
+IPTOS_LOWDELAY; Samba's default TCP_NODELAY + FreeBSD autotuning is correct.)
+
+FreeBSD sysctls persisted as TrueNAS tunables: `kern.ipc.maxsockbuf=16M`,
+`net.inet.tcp.sendbuf_max=8M`, `recvbuf_max=8M`, `sendbuf_inc=64K`.
 
 ## Gotchas
 
 - **Sandbox**: Claude Code's shell runs in a filesystem sandbox. Use `dangerouslyDisableSandbox: true` for any command that needs real filesystem/network access (mounting drives, testing SMB connections).
 - **Port 445**: Windows kernel reserves port 445. The remote server is on port 3445 (socat proxy on gateway forwards to TrueNAS:445).
+- **DO NOT replace socat with kernel DNAT**: tried and root-caused 2026-07-20. FreeBSD 13.1's base TCP stack (TrueNAS CORE, no RACK/pacing modules) collapses to ~10 Mbps with retransmit storms as a WAN sender on this path, while a Linux sender does 77-92 Mbps clean (iperf3 + captures prove the path itself is loss-free: UDP 80 Mbps = 0%). Split TCP at the gateway gives both WAN directions a Linux sender. socat now runs as systemd unit `smb-relay.service` on the gateway (1 MB blocks, nodelay, no nice, autostart).
 - **winfspy install**: may need Visual C++ build tools if no wheel is available. Check `pip install winfspy` first.
 - **Process lifetime**: the FUSE mount runs as long as the process lives. For auto-start, use a scheduled task or Windows service wrapper.
 - **SMB credits**: smbprotocol defaults to requesting minimal credits. We echo-request credits on connect and request replenishment with each pipelined write. Without this, 8 MB writes fail with "not enough credits".
@@ -106,3 +117,4 @@ smb2 max credits = 8192
 ## Coding agents
 
 Plans go in `.claude/plans`, no exceptions.
+Don't use `gh`, this repo uses a PAT to act as the github link and all commits should be under the user defined in conf.toml. 

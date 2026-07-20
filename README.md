@@ -24,13 +24,14 @@ Windows (local-site)                          client-site LAN
 
 ## Performance
 
-| Method | Read size | Speed | Throughput |
-|--------|-----------|-------|------------|
-| rclone SMB (current) | 64 KB | 5.0 MB/s | 40 Mbps |
-| nas-mount | 4 MB | 10.7 MB/s | 86 Mbps |
-| Physical cap | — | 12.5 MB/s | 100 Mbps |
+| Method | Reads | Throughput |
+|--------|-----------|------------|
+| rclone SMB (64 KB) | 5.0 MB/s | 40 Mbps |
+| nas-mount single 4 MB | 10.9 MB/s | 87 Mbps |
+| nas-mount pipelined | **12.5 MB/s** | **100 Mbps — line rate** |
 
-Writes already saturate at ~400 Mbps (50 MB/s) via the same path.
+Writes: sliding-window pipeline measured at 57 MB/s (458 Mbps) raw; the
+end-to-end TCP ceiling on this path is ~580 Mbps.
 
 ## Requirements
 

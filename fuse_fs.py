@@ -2,6 +2,7 @@ import time
 import bisect
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from winfspy import (
     BaseFileSystemOperations,
@@ -29,6 +30,8 @@ SECURITY_DESCRIPTOR = SecurityDescriptor.from_string(
     "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)"
 )
 
+STATUS_FILE_IS_A_DIRECTORY = 0xC00000BA
+
 
 def _smb_dt_to_filetime(dt):
     if dt is None:
@@ -51,8 +54,9 @@ class SmbFileContext:
     __slots__ = ("path", "smb_path", "smb_open", "is_directory",
                  "file_attributes", "file_size", "allocation_size",
                  "creation_time", "last_access_time", "last_write_time",
-                 "change_time", "_buf", "_buf_start", "_buf_end",
-                 "_wbuf", "_wbuf_offset", "_delete_pending")
+                 "change_time", "io_lock",
+                 "ra_buf", "ra_start", "ra_futures", "seq_end",
+                 "writer", "co_buf", "co_off", "_delete_pending")
 
     def __init__(self, path, smb_path, smb_open=None, is_directory=False,
                  file_attributes=0, file_size=0, allocation_size=0,
@@ -69,11 +73,18 @@ class SmbFileContext:
         self.last_access_time = last_access_time
         self.last_write_time = last_write_time
         self.change_time = change_time
-        self._buf = None
-        self._buf_start = 0
-        self._buf_end = 0
-        self._wbuf = bytearray()
-        self._wbuf_offset = 0
+        # Serializes read/write state per handle. Held across network waits;
+        # concurrency across *different* files is what matters for throughput.
+        self.io_lock = threading.Lock()
+        # Read-ahead state: current window + in-flight window futures.
+        self.ra_buf = None
+        self.ra_start = 0
+        self.ra_futures = {}  # window_start -> Future(bytes)
+        self.seq_end = -1     # end offset of last read (sequential detection)
+        # Write-behind state: coalescing buffer + pipelined writer.
+        self.writer = None
+        self.co_buf = bytearray()
+        self.co_off = 0
         self._delete_pending = False
 
     def get_file_info(self):
@@ -88,30 +99,26 @@ class SmbFileContext:
             "index_number": 0,
         }
 
+    def has_pending_writes(self):
+        return bool(self.co_buf) or (self.writer is not None
+                                     and self.writer.in_flight > 0)
+
 
 class SmbFileSystemOperations(BaseFileSystemOperations):
 
-    WRITE_PIPELINE_DEPTH = 4
-
-    def __init__(self, smb_client, subpath="", dir_cache_ttl=300):
+    def __init__(self, smb_client, subpath="", dir_cache_ttl=300,
+                 readahead_windows=2, readahead_workers=8):
         super().__init__()
         self._smb = smb_client
         self._subpath = subpath.replace("/", "\\")
         self._dir_cache_ttl = dir_cache_ttl
         self._dir_cache = {}
         self._cache_lock = threading.Lock()
-        self._write_flush_size = smb_client.write_size * self.WRITE_PIPELINE_DEPTH
+        self._readahead_windows = readahead_windows
+        self._executor = ThreadPoolExecutor(
+            max_workers=readahead_workers, thread_name_prefix="readahead")
 
-    def _flush_write_buf(self, file_context):
-        buf = file_context._wbuf
-        if not buf:
-            return
-        data = bytes(buf)
-        size = len(data)
-        offset = file_context._wbuf_offset
-        file_context._wbuf = bytearray()
-        log.debug("flush_write %s offset=%d len=%d", file_context.path, offset, size)
-        self._smb.write_file(file_context.smb_open, data, offset)
+    # -- path helpers --
 
     def _to_smb_path(self, winfsp_path):
         relative = winfsp_path.lstrip("\\")
@@ -130,6 +137,8 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
 
     def _file_name(self, winfsp_path):
         return winfsp_path.rstrip("\\").rsplit("\\", 1)[-1]
+
+    # -- directory cache --
 
     def _get_cached_dir(self, smb_path):
         with self._cache_lock:
@@ -169,6 +178,18 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
         entries.sort(key=lambda e: e["file_name"].lower())
         self._set_cached_dir(smb_path, entries)
         return entries
+
+    def _lookup_in_parent_cache(self, winfsp_path):
+        """Lookup via the parent dir cache only - no SMB round trips."""
+        parent_smb = self._to_smb_path(self._parent_path(winfsp_path))
+        cached = self._get_cached_dir(parent_smb)
+        if cached is None:
+            return None
+        name_lower = self._file_name(winfsp_path).lower()
+        for entry in cached:
+            if entry["file_name"].lower() == name_lower:
+                return entry
+        return None
 
     def _lookup_in_parent(self, winfsp_path):
         parent = self._parent_path(winfsp_path)
@@ -223,6 +244,112 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
         log.error("Unexpected error: %s", exc)
         raise NTStatusError(NTSTATUS.STATUS_UNEXPECTED_IO_ERROR)
 
+    # -- write-behind plumbing (call with ctx.io_lock held) --
+
+    def _drain_writes(self, ctx):
+        """Push out the coalescing buffer and wait for all in-flight
+        writes. Raises on write failure so callers can surface it."""
+        if ctx.smb_open is None:
+            return
+        if ctx.co_buf:
+            data = bytes(ctx.co_buf)
+            offset = ctx.co_off
+            ctx.co_buf = bytearray()
+            if ctx.writer is None:
+                ctx.writer = self._smb.make_writer(ctx.smb_open)
+            ctx.writer.submit(data, offset)
+        if ctx.writer is not None:
+            ctx.writer.drain()
+
+    def _discard_writes(self, ctx):
+        """Drop the coalescing buffer; still waits out in-flight requests
+        (protocol responses must be collected) but ignores errors."""
+        ctx.co_buf = bytearray()
+        if ctx.writer is not None:
+            try:
+                ctx.writer.drain()
+            except Exception as e:
+                log.debug("discard_writes(%s): %s", ctx.path, e)
+
+    # -- read-ahead plumbing (call with ctx.io_lock held) --
+
+    def _window_size(self):
+        return self._smb.read_size
+
+    def _fetch_window(self, ctx, wstart):
+        wsize = self._window_size()
+        wlen = min(wsize, ctx.file_size - wstart)
+        if wlen <= 0:
+            return b""
+        return self._smb.read_file_pipelined(ctx.smb_open, wstart, wlen)
+
+    def _ensure_prefetch(self, ctx, wstart):
+        """Schedule a background fetch of the window at wstart if not
+        already current, in flight, or past EOF."""
+        if wstart >= ctx.file_size:
+            return
+        if ctx.ra_buf is not None and wstart == ctx.ra_start:
+            return
+        if wstart in ctx.ra_futures:
+            return
+        ctx.ra_futures[wstart] = self._executor.submit(
+            self._fetch_window, ctx, wstart)
+
+    def _promote_window(self, ctx, wstart):
+        """Make the window at wstart current, waiting on its future or
+        fetching it synchronously."""
+        fut = ctx.ra_futures.pop(wstart, None)
+        if fut is not None:
+            data = fut.result()
+        else:
+            data = self._fetch_window(ctx, wstart)
+        ctx.ra_buf = data
+        ctx.ra_start = wstart
+        # Windows before the current one are stale.
+        for k in [k for k in ctx.ra_futures if k <= wstart]:
+            ctx.ra_futures.pop(k)
+        return data
+
+    def _drop_readahead(self, ctx, wait=False):
+        ctx.ra_buf = None
+        futures = ctx.ra_futures
+        ctx.ra_futures = {}
+        for fut in futures.values():
+            fut.cancel()
+        if wait:
+            # In-flight fetches reference the SMB handle; let them finish
+            # before the caller closes it.
+            for fut in futures.values():
+                if not fut.cancelled():
+                    try:
+                        fut.result(timeout=60)
+                    except Exception:
+                        pass
+
+    def _read_from_windows(self, ctx, offset, length):
+        """Assemble `length` bytes starting at offset from the current
+        window chain, promoting/prefetching as needed."""
+        wsize = self._window_size()
+        out = bytearray()
+        pos = offset
+        end = offset + length
+        while pos < end:
+            wstart = (pos // wsize) * wsize
+            if not (ctx.ra_buf is not None and ctx.ra_start == wstart):
+                self._promote_window(ctx, wstart)
+            buf = ctx.ra_buf
+            rel = pos - wstart
+            if rel >= len(buf):
+                break  # EOF or short read from server
+            take = buf[rel:min(rel + (end - pos), len(buf))]
+            out.extend(take)
+            pos += len(take)
+            # Keep the pipeline primed while we're consuming this window.
+            if pos >= wstart + (wsize // 2):
+                for i in range(1, self._readahead_windows + 1):
+                    self._ensure_prefetch(ctx, wstart + i * wsize)
+        return bytes(out)
+
     # -- WinFsp callbacks --
 
     def get_volume_info(self):
@@ -270,10 +397,13 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
                 change_time=filetime_now(),
             )
 
-        info = self._lookup_in_parent(file_name)
-        is_dir = False
+        # Cheap lookup first (cache only). On a miss, open the file handle
+        # directly - the open response carries all metadata, so a cold open
+        # costs one round trip instead of listing the whole parent.
+        info = self._lookup_in_parent_cache(file_name)
         if info:
-            is_dir = bool(info["file_attributes"] & FILE_ATTRIBUTE.FILE_ATTRIBUTE_DIRECTORY)
+            is_dir = bool(info["file_attributes"]
+                          & FILE_ATTRIBUTE.FILE_ATTRIBUTE_DIRECTORY)
         else:
             is_dir = bool(create_options & 0x1)
 
@@ -281,24 +411,19 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
         if not is_dir:
             want_write = bool(granted_access & 0x12B0116)
             try:
-                smb_open = self._smb.open_file(smb_path, read=True, write=want_write)
+                smb_open = self._smb.open_file(smb_path, read=True,
+                                               write=want_write)
+            except SMBResponseException as e:
+                if e.status == STATUS_FILE_IS_A_DIRECTORY:
+                    is_dir = True
+                else:
+                    log.error("open(%s) SMB open failed: %s", file_name, e)
+                    self._handle_smb_error(e)
             except Exception as e:
                 log.error("open(%s) SMB open failed: %s", file_name, e)
                 self._handle_smb_error(e)
 
-        if info:
-            ctx = SmbFileContext(
-                path=file_name, smb_path=smb_path, smb_open=smb_open,
-                is_directory=is_dir,
-                file_attributes=info["file_attributes"],
-                file_size=info["file_size"],
-                allocation_size=info["allocation_size"],
-                creation_time=info["creation_time"],
-                last_access_time=info["last_access_time"],
-                last_write_time=info["last_write_time"],
-                change_time=info["change_time"],
-            )
-        elif smb_open:
+        if smb_open:
             ctx = SmbFileContext(
                 path=file_name, smb_path=smb_path, smb_open=smb_open,
                 is_directory=False,
@@ -310,23 +435,53 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
                 last_write_time=_smb_dt_to_filetime(smb_open.last_write_time),
                 change_time=_smb_dt_to_filetime(smb_open.change_time),
             )
-        else:
+        elif info:
             ctx = SmbFileContext(
-                path=file_name, smb_path=smb_path, is_directory=True,
-                file_attributes=FILE_ATTRIBUTE.FILE_ATTRIBUTE_DIRECTORY,
+                path=file_name, smb_path=smb_path, smb_open=None,
+                is_directory=is_dir,
+                file_attributes=info["file_attributes"],
+                file_size=info["file_size"],
+                allocation_size=info["allocation_size"],
+                creation_time=info["creation_time"],
+                last_access_time=info["last_access_time"],
+                last_write_time=info["last_write_time"],
+                change_time=info["change_time"],
+            )
+        else:
+            # Directory (or file we could not open as file): stat for real
+            # metadata; fall back to bare directory attrs.
+            stat = self._stat_via_smb(file_name)
+            if stat is None:
+                raise NTStatusObjectNameNotFound()
+            ctx = SmbFileContext(
+                path=file_name, smb_path=smb_path,
+                is_directory=bool(stat["file_attributes"]
+                                  & FILE_ATTRIBUTE.FILE_ATTRIBUTE_DIRECTORY),
+                file_attributes=stat["file_attributes"],
+                file_size=stat["file_size"],
+                allocation_size=stat["allocation_size"],
+                creation_time=stat["creation_time"],
+                last_access_time=stat["last_access_time"],
+                last_write_time=stat["last_write_time"],
+                change_time=stat["change_time"],
             )
         return ctx
 
     def close(self, file_context):
-        file_context._buf = None
-        if file_context.smb_open is not None:
-            if not file_context._delete_pending:
-                try:
-                    self._flush_write_buf(file_context)
-                except Exception as e:
-                    log.debug("flush on close(%s) failed: %s", file_context.path, e)
-            self._smb.close_file(file_context.smb_open)
-            file_context.smb_open = None
+        with file_context.io_lock:
+            self._drop_readahead(file_context, wait=True)
+            if file_context.smb_open is not None:
+                if file_context._delete_pending:
+                    self._discard_writes(file_context)
+                else:
+                    try:
+                        self._drain_writes(file_context)
+                    except Exception as e:
+                        log.error("flush on close(%s) failed: %s",
+                                  file_context.path, e)
+                self._smb.close_file(file_context.smb_open)
+                file_context.smb_open = None
+                file_context.writer = None
         if file_context._delete_pending:
             smb_path = file_context.smb_path
             if file_context.is_directory:
@@ -337,48 +492,35 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
     def get_file_info(self, file_context):
         return file_context.get_file_info()
 
-    def _smb_read_chunked(self, file_context, offset, length):
-        chunk_size = self._smb.read_size
-        if length <= chunk_size:
-            return self._smb.read_file(file_context.smb_open, offset, length)
-        parts = []
-        remaining = length
-        pos = offset
-        while remaining > 0:
-            to_read = min(chunk_size, remaining)
-            data = self._smb.read_file(file_context.smb_open, pos, to_read)
-            if not data:
-                break
-            parts.append(data)
-            pos += len(data)
-            remaining -= len(data)
-        return b"".join(parts)
-
     def read(self, file_context, offset, length):
-        if file_context.smb_open is None:
+        ctx = file_context
+        if ctx.smb_open is None:
             raise NTStatusEndOfFile()
-        if offset >= file_context.file_size:
-            raise NTStatusEndOfFile()
-        length = min(length, file_context.file_size - offset)
         try:
-            buf = file_context._buf
-            buf_start = file_context._buf_start
-            buf_end = file_context._buf_end
-            if buf is not None and buf_start <= offset and offset + length <= buf_end:
-                s = offset - buf_start
-                return buf[s:s + length]
+            with ctx.io_lock:
+                if offset >= ctx.file_size:
+                    raise NTStatusEndOfFile()
+                length = min(length, ctx.file_size - offset)
+                # Write-then-read consistency: anything buffered must hit
+                # the server before we read.
+                if ctx.has_pending_writes():
+                    self._drain_writes(ctx)
 
-            readahead = self._smb.read_size
-            fetch_len = max(length, readahead)
-            fetch_len = min(fetch_len, file_context.file_size - offset)
-            data = self._smb_read_chunked(file_context, offset, fetch_len)
-            if len(data) > length:
-                file_context._buf = data
-                file_context._buf_start = offset
-                file_context._buf_end = offset + len(data)
-            else:
-                file_context._buf = None
-            return data[:length]
+                wsize = self._window_size()
+                sequential = (offset == ctx.seq_end
+                              or (ctx.ra_buf is not None
+                                  and ctx.ra_start <= offset < ctx.ra_start
+                                  + len(ctx.ra_buf)))
+                if not sequential:
+                    # Random seek: throw away stale windows.
+                    self._drop_readahead(ctx)
+                data = self._read_from_windows(ctx, offset, length)
+                ctx.seq_end = offset + len(data)
+                if not data:
+                    raise NTStatusEndOfFile()
+                return data
+        except NTStatusError:
+            raise
         except Exception as e:
             log.error("read(%s, offset=%d, len=%d) failed: %s",
                       file_context.path, offset, length, e)
@@ -452,35 +594,60 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
 
     def write(self, file_context, buffer, offset, write_to_end_of_file,
               constrained_io):
-        if file_context.smb_open is None:
+        ctx = file_context
+        if ctx.smb_open is None:
             raise NTStatusError(NTSTATUS.STATUS_INVALID_HANDLE)
         try:
-            if write_to_end_of_file:
-                offset = file_context.file_size
-            data = bytes(buffer)
-            length = len(data)
-            wbuf = file_context._wbuf
-            flush_size = self._write_flush_size
+            with ctx.io_lock:
+                data = bytes(buffer)
+                if write_to_end_of_file:
+                    offset = ctx.file_size
+                if constrained_io:
+                    # Constrained writes must not extend the file.
+                    if offset >= ctx.file_size:
+                        return 0
+                    if offset + len(data) > ctx.file_size:
+                        data = data[:ctx.file_size - offset]
+                length = len(data)
+                if length == 0:
+                    return 0
 
-            if wbuf and offset == file_context._wbuf_offset + len(wbuf):
-                wbuf.extend(data)
-            else:
-                if wbuf:
-                    self._flush_write_buf(file_context)
-                file_context._wbuf = bytearray(data)
-                file_context._wbuf_offset = offset
+                if ctx.writer is None:
+                    ctx.writer = self._smb.make_writer(ctx.smb_open)
 
-            if len(file_context._wbuf) >= flush_size:
-                self._flush_write_buf(file_context)
+                write_size = self._smb.write_size
+                if ctx.co_buf and offset == ctx.co_off + len(ctx.co_buf):
+                    ctx.co_buf.extend(data)
+                else:
+                    if ctx.co_buf:
+                        # Non-sequential write: push out what we have.
+                        pending = bytes(ctx.co_buf)
+                        poff = ctx.co_off
+                        ctx.co_buf = bytearray()
+                        ctx.writer.submit(pending, poff)
+                    ctx.co_buf = bytearray(data)
+                    ctx.co_off = offset
 
-            new_end = offset + length
-            if new_end > file_context.file_size:
-                file_context.file_size = new_end
-                file_context.allocation_size = new_end
-            file_context.last_write_time = filetime_now()
-            file_context.change_time = file_context.last_write_time
-            file_context._buf = None
-            return length
+                # Feed full chunks into the pipeline, keep the remainder
+                # coalescing. submit() applies backpressure when the
+                # window is full, pacing us at network speed.
+                while len(ctx.co_buf) >= write_size:
+                    chunk = bytes(ctx.co_buf[:write_size])
+                    ctx.writer.submit(chunk, ctx.co_off)
+                    ctx.co_buf = ctx.co_buf[write_size:]
+                    ctx.co_off += write_size
+
+                new_end = offset + length
+                if new_end > ctx.file_size:
+                    ctx.file_size = new_end
+                    ctx.allocation_size = new_end
+                ctx.last_write_time = filetime_now()
+                ctx.change_time = ctx.last_write_time
+                # Any cached read data overlapping the write is stale.
+                self._drop_readahead(ctx)
+                return length
+        except NTStatusError:
+            raise
         except Exception as e:
             log.error("write(%s, offset=%d, len=%d) failed: %s",
                       file_context.path, offset, len(buffer), e)
@@ -488,16 +655,19 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
 
     def overwrite(self, file_context, file_attributes, replace_file_attributes,
                   allocation_size):
+        ctx = file_context
         try:
-            self._smb.set_end_of_file(file_context.smb_open, 0)
-            file_context.file_size = 0
-            file_context.allocation_size = 0
-            if replace_file_attributes:
-                file_context.file_attributes = (
-                    file_attributes or FILE_ATTRIBUTE.FILE_ATTRIBUTE_NORMAL)
-            file_context.last_write_time = filetime_now()
-            file_context.change_time = file_context.last_write_time
-            file_context._buf = None
+            with ctx.io_lock:
+                self._discard_writes(ctx)
+                self._drop_readahead(ctx)
+                self._smb.set_end_of_file(ctx.smb_open, 0)
+                ctx.file_size = 0
+                ctx.allocation_size = 0
+                if replace_file_attributes:
+                    ctx.file_attributes = (
+                        file_attributes or FILE_ATTRIBUTE.FILE_ATTRIBUTE_NORMAL)
+                ctx.last_write_time = filetime_now()
+                ctx.change_time = ctx.last_write_time
         except Exception as e:
             log.error("overwrite(%s) failed: %s", file_context.path, e)
             self._handle_smb_error(e)
@@ -518,12 +688,15 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
                 log.error("cleanup delete(%s) failed: %s", file_name, e)
 
     def flush(self, file_context):
-        if file_context.smb_open is not None:
+        ctx = file_context
+        if ctx.smb_open is not None:
             try:
-                self._flush_write_buf(file_context)
-                self._smb.flush_file(file_context.smb_open)
+                with ctx.io_lock:
+                    self._drain_writes(ctx)
+                self._smb.flush_file(ctx.smb_open)
             except Exception as e:
-                log.debug("flush(%s) failed: %s", file_context.path, e)
+                log.error("flush(%s) failed: %s", file_context.path, e)
+                self._handle_smb_error(e)
 
     def get_security(self, file_context):
         return SECURITY_DESCRIPTOR
@@ -546,12 +719,17 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
         return file_context.get_file_info()
 
     def set_file_size(self, file_context, new_size, set_allocation_size):
+        ctx = file_context
         try:
-            if not set_allocation_size:
-                self._smb.set_end_of_file(file_context.smb_open, new_size)
-                file_context.file_size = new_size
-            file_context.allocation_size = new_size
-            file_context._buf = None
+            with ctx.io_lock:
+                # Buffered writes must land before we move EOF, otherwise a
+                # later flush would re-extend the file.
+                self._drain_writes(ctx)
+                self._drop_readahead(ctx)
+                if not set_allocation_size:
+                    self._smb.set_end_of_file(ctx.smb_open, new_size)
+                    ctx.file_size = new_size
+                ctx.allocation_size = new_size
         except Exception as e:
             log.error("set_file_size(%s, %d) failed: %s",
                       file_context.path, new_size, e)
@@ -574,6 +752,8 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
         old_smb = self._to_smb_path(file_name)
         new_smb = self._to_smb_path(new_file_name)
         try:
+            with file_context.io_lock:
+                self._drain_writes(file_context)
             self._smb.rename(old_smb, new_smb, replace_if_exists=replace_if_exists)
             file_context.path = new_file_name
             file_context.smb_path = new_smb
@@ -582,6 +762,8 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
             self._invalidate_cache(old_parent)
             if new_parent != old_parent:
                 self._invalidate_cache(new_parent)
+        except NTStatusError:
+            raise
         except Exception as e:
             log.error("rename(%s -> %s) failed: %s", file_name, new_file_name, e)
             self._handle_smb_error(e)

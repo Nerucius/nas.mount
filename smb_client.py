@@ -2,6 +2,7 @@ import uuid
 import time
 import logging
 import threading
+from collections import deque
 from datetime import datetime, timezone
 
 from smbprotocol.connection import Connection
@@ -35,6 +36,12 @@ log = logging.getLogger(__name__)
 
 EPOCH_AS_FILETIME = 116444736000000000  # 1601-01-01 in 100ns ticks
 
+STATUS_END_OF_FILE = 0xC0000011
+
+# Errors that mean the TCP connection (or the SMB session on it) is gone.
+CONNECTION_ERRORS = (SMBConnectionClosed, ConnectionError, BrokenPipeError,
+                     TimeoutError, OSError)
+
 
 def dt_to_filetime(dt: datetime) -> int:
     if dt is None:
@@ -42,10 +49,85 @@ def dt_to_filetime(dt: datetime) -> int:
     return EPOCH_AS_FILETIME + int(dt.timestamp() * 10_000_000)
 
 
+def _credit_charge(nbytes):
+    return (nbytes + 65535) // 65536
+
+
+class PipelinedWriter:
+    """Sliding-window pipelined writer for one open SMB file handle.
+
+    submit() splits data into write_size chunks and keeps up to `depth`
+    write requests in flight. It blocks (backpressure) when the window is
+    full, so callers are naturally paced at network speed while the
+    connection never goes idle between chunks or between submit() calls.
+    drain() waits for everything outstanding.
+
+    Not thread-safe per instance: one writer belongs to one file handle and
+    is driven under the owning file context's lock.
+    """
+
+    def __init__(self, client, file_open, depth):
+        self._client = client
+        self._file_open = file_open
+        self._depth = depth
+        self._pending = deque()  # (request, receive_func, nbytes)
+        self.bytes_acked = 0
+
+    @property
+    def in_flight(self):
+        return len(self._pending)
+
+    def submit(self, data, offset):
+        conn = self._file_open.connection
+        chunk_size = min(self._client.write_size, conn.max_write_size)
+        pos = 0
+        n = len(data)
+        while pos < n:
+            end = min(pos + chunk_size, n)
+            self._send_chunk(data[pos:end], offset + pos)
+            pos = end
+
+    def _send_chunk(self, chunk, offset):
+        conn = self._file_open.connection
+        sid = self._file_open.tree_connect.session.session_id
+        tid = self._file_open.tree_connect.tree_connect_id
+        charge = _credit_charge(len(chunk))
+
+        while len(self._pending) >= self._depth:
+            self._complete_one()
+        # smbprotocol raises if a request exceeds available credits, so
+        # drain in-flight responses (which replenish credits) until we fit.
+        while self._client._available_credits() < charge and self._pending:
+            self._complete_one()
+
+        msg, recv = self._file_open.write(chunk, offset, send=False)
+        request = conn.send(msg, sid, tid, credit_request=charge + 8)
+        self._pending.append((request, recv, len(chunk)))
+
+    def _complete_one(self):
+        request, recv, nbytes = self._pending.popleft()
+        self.bytes_acked += recv(request)
+
+    def drain(self):
+        while self._pending:
+            self._complete_one()
+
+
 class SMBClient:
+    """Thread-safe SMB connection wrapper.
+
+    smbprotocol's Connection is internally thread-safe (socket send lock,
+    sequence/credit lock, dedicated receiver thread with per-request
+    events), so SMB operations here run concurrently without a global
+    lock. A state lock only serializes connect/disconnect/reconnect, and
+    reconnects are single-flight: whichever thread hits the dead socket
+    first rebuilds the connection, everyone else fails fast and lets the
+    caller (Windows) retry.
+    """
 
     def __init__(self, host, port, username, password, share_name,
                  read_size=4 * 1024 * 1024, write_size=4 * 1024 * 1024,
+                 read_pipeline_depth=3, write_pipeline_depth=4,
                  reconnect_delay=5, max_reconnect_attempts=10):
         self.host = host
         self.port = port
@@ -54,10 +136,12 @@ class SMBClient:
         self.share_name = share_name
         self.read_size = read_size
         self.write_size = write_size
+        self.read_pipeline_depth = read_pipeline_depth
+        self.write_pipeline_depth = write_pipeline_depth
         self.reconnect_delay = reconnect_delay
         self.max_reconnect_attempts = max_reconnect_attempts
 
-        self._lock = threading.Lock()
+        self._state_lock = threading.RLock()
         self._connection = None
         self._session = None
         self._tree = None
@@ -66,8 +150,14 @@ class SMBClient:
     def connected(self):
         return self._tree is not None
 
+    def _available_credits(self):
+        sw = self._connection.sequence_window
+        return sw["high"] - sw["low"]
+
+    # -- connection lifecycle --
+
     def connect(self, timeout=30):
-        with self._lock:
+        with self._state_lock:
             self._connect(timeout)
 
     def _connect(self, timeout=30):
@@ -91,16 +181,21 @@ class SMBClient:
         self._tree = TreeConnect(self._session, unc)
         self._tree.connect(require_secure_negotiate=False)
 
-        credits_per_op = max(self.read_size, self.write_size) // 65536
-        credits_needed = credits_per_op * 4 + 32
-        granted = self._connection.echo(
-            sid=self._session.session_id, credit_request=credits_needed)
+        # Pre-load enough credits for full read+write pipelines. The server
+        # grants credits incrementally, so echo until the pool is deep enough.
+        per_op = max(self.read_size, self.write_size) // 65536
+        target = per_op * (self.read_pipeline_depth + self.write_pipeline_depth) + 64
+        for _ in range(6):
+            if self._available_credits() >= target:
+                break
+            self._connection.echo(sid=self._session.session_id,
+                                  credit_request=target)
         sw = self._connection.sequence_window
         log.info("Connected to %s (credits: %d available)",
                  unc, sw["high"] - sw["low"])
 
     def disconnect(self):
-        with self._lock:
+        with self._state_lock:
             self._disconnect()
 
     def _disconnect(self):
@@ -118,7 +213,7 @@ class SMBClient:
         log.info("Disconnected")
 
     def reconnect(self):
-        with self._lock:
+        with self._state_lock:
             self._reconnect()
 
     def _reconnect(self):
@@ -139,16 +234,88 @@ class SMBClient:
                                   % self.max_reconnect_attempts)
 
     def _with_reconnect(self, fn):
+        failed_conn = self._connection
         try:
             return fn()
-        except (SMBConnectionClosed, OSError) as e:
+        except CONNECTION_ERRORS as e:
             log.warning("Connection lost (%s), attempting reconnect", e)
-            self._reconnect()
+            with self._state_lock:
+                # Single-flight: only reconnect if nobody else already did.
+                if self._connection is failed_conn:
+                    self._reconnect()
             raise
 
+    # -- reads --
+
+    def read_file(self, file_open, offset, length):
+        """Single-request read (length must be <= negotiated max read)."""
+        return self._with_reconnect(lambda: file_open.read(offset, length))
+
+    def read_file_pipelined(self, file_open, offset, length):
+        """Read `length` bytes keeping read_pipeline_depth requests in
+        flight so the pipe never drains between chunks."""
+        return self._with_reconnect(
+            lambda: self._read_pipelined(file_open, offset, length))
+
+    def _read_pipelined(self, file_open, offset, length):
+        conn = file_open.connection
+        sid = file_open.tree_connect.session.session_id
+        tid = file_open.tree_connect.tree_connect_id
+        chunk_size = min(self.read_size, conn.max_read_size)
+
+        pending = deque()  # (request, receive_func, expected_len)
+        parts = []
+        eof = False
+        pos = offset
+        end = offset + length
+        while pos < end or pending:
+            while (not eof and pos < end
+                   and len(pending) < self.read_pipeline_depth):
+                n = min(chunk_size, end - pos)
+                charge = _credit_charge(n)
+                if self._available_credits() < charge and pending:
+                    break
+                msg, recv = file_open.read(pos, n, send=False)
+                request = conn.send(msg, sid, tid, credit_request=charge + 8)
+                pending.append((request, recv, n))
+                pos += n
+            request, recv, expected = pending.popleft()
+            try:
+                data = recv(request)
+            except SMBResponseException as e:
+                if e.status == STATUS_END_OF_FILE:
+                    eof = True
+                    continue
+                raise
+            if not eof:
+                parts.append(data)
+                if len(data) < expected:
+                    # Short read: stop here so the result stays contiguous.
+                    # Remaining in-flight responses are drained and discarded.
+                    eof = True
+        return b"".join(parts)
+
+    # -- writes --
+
+    def make_writer(self, file_open):
+        return PipelinedWriter(self, file_open, self.write_pipeline_depth)
+
+    def write_file(self, file_open, data, offset=0):
+        if not isinstance(data, bytes):
+            data = bytes(data)
+        return self._with_reconnect(
+            lambda: self._write_file(file_open, data, offset))
+
+    def _write_file(self, file_open, data, offset):
+        writer = self.make_writer(file_open)
+        writer.submit(data, offset)
+        writer.drain()
+        return writer.bytes_acked
+
+    # -- metadata operations (rely on smbprotocol's internal locking) --
+
     def list_directory(self, path=""):
-        with self._lock:
-            return self._with_reconnect(lambda: self._list_directory(path))
+        return self._with_reconnect(lambda: self._list_directory(path))
 
     def _list_directory(self, path):
         dir_open = Open(self._tree, path)
@@ -188,8 +355,7 @@ class SMBClient:
                 pass
 
     def stat_path(self, path):
-        with self._lock:
-            return self._with_reconnect(lambda: self._stat_path(path))
+        return self._with_reconnect(lambda: self._stat_path(path))
 
     def _stat_path(self, path):
         is_root = path == "" or path == "\\"
@@ -229,9 +395,8 @@ class SMBClient:
                 pass
 
     def open_file(self, path, read=True, write=False):
-        with self._lock:
-            return self._with_reconnect(
-                lambda: self._open_file(path, read, write))
+        return self._with_reconnect(
+            lambda: self._open_file(path, read, write))
 
     def _open_file(self, path, read, write):
         file_open = Open(self._tree, path)
@@ -254,80 +419,27 @@ class SMBClient:
         )
         return file_open
 
-    def read_file(self, file_open, offset, length):
-        with self._lock:
-            return self._with_reconnect(
-                lambda: file_open.read(offset, length))
-
-    def write_file(self, file_open, data, offset=0):
-        if not isinstance(data, bytes):
-            data = bytes(data)
-        with self._lock:
-            return self._with_reconnect(
-                lambda: self._write_file(file_open, data, offset))
-
-    def _write_file(self, file_open, data, offset):
-        chunk_size = min(self.write_size, self._connection.max_write_size)
-        chunks = []
-        pos = 0
-        while pos < len(data):
-            end = min(pos + chunk_size, len(data))
-            chunks.append((data[pos:end], offset + pos))
-            pos = end
-
-        if len(chunks) <= 1:
-            return file_open.write(chunks[0][0], chunks[0][1]) if chunks else 0
-
-        pending = []
-        sid = file_open.tree_connect.session.session_id
-        tid = file_open.tree_connect.tree_connect_id
-        credits_per = chunk_size // 65536
-        for chunk_data, chunk_offset in chunks:
-            msg, recv_func = file_open.write(chunk_data, chunk_offset, send=False)
-            request = self._connection.send(
-                msg, sid, tid, credit_request=credits_per)
-            pending.append((request, recv_func))
-
-        total = 0
-        for request, recv_func in pending:
-            total += recv_func(request)
-        return total
-
     def set_delete_on_close(self, file_open):
-        with self._lock:
-            return self._with_reconnect(
-                lambda: self._set_delete_on_close(file_open))
+        return self._with_reconnect(
+            lambda: self._set_delete_on_close(file_open))
 
     def _set_delete_on_close(self, file_open):
         info = FileDispositionInformation()
         info["delete_pending"] = True
-        req = SMB2SetInfoRequest()
-        req["info_type"] = info.INFO_TYPE
-        req["file_info_class"] = info.INFO_CLASS
-        req["file_id"] = file_open.file_id
-        req["buffer"] = info
-        request = file_open.connection.send(
-            req, file_open.tree_connect.session.session_id,
-            file_open.tree_connect.tree_connect_id)
-        response = file_open.connection.receive(request)
-        resp = SMB2SetInfoResponse()
-        resp.unpack(response["data"].get_value())
+        self._set_info(file_open, info)
 
     def close_file(self, file_open):
-        with self._lock:
-            try:
-                file_open.close()
-            except Exception as e:
-                log.debug("Error closing file: %s", e)
+        try:
+            file_open.close()
+        except Exception as e:
+            log.debug("Error closing file: %s", e)
 
     def flush_file(self, file_open):
-        with self._lock:
-            return self._with_reconnect(lambda: file_open.flush())
+        return self._with_reconnect(lambda: file_open.flush())
 
     def create_file(self, path, is_directory=False):
-        with self._lock:
-            return self._with_reconnect(
-                lambda: self._create_file(path, is_directory))
+        return self._with_reconnect(
+            lambda: self._create_file(path, is_directory))
 
     def _create_file(self, path, is_directory):
         file_open = Open(self._tree, path)
@@ -359,8 +471,7 @@ class SMBClient:
         return file_open
 
     def delete_file(self, path):
-        with self._lock:
-            return self._with_reconnect(lambda: self._delete_file(path))
+        return self._with_reconnect(lambda: self._delete_file(path))
 
     def _delete_file(self, path):
         file_open = Open(self._tree, path)
@@ -375,8 +486,7 @@ class SMBClient:
         file_open.close()
 
     def delete_directory(self, path):
-        with self._lock:
-            return self._with_reconnect(lambda: self._delete_directory(path))
+        return self._with_reconnect(lambda: self._delete_directory(path))
 
     def _delete_directory(self, path):
         dir_open = Open(self._tree, path)
@@ -391,29 +501,17 @@ class SMBClient:
         dir_open.close()
 
     def set_end_of_file(self, file_open, size):
-        with self._lock:
-            return self._with_reconnect(
-                lambda: self._set_end_of_file(file_open, size))
+        return self._with_reconnect(
+            lambda: self._set_end_of_file(file_open, size))
 
     def _set_end_of_file(self, file_open, size):
         info = FileEndOfFileInformation()
         info["end_of_file"] = size
-        req = SMB2SetInfoRequest()
-        req["info_type"] = info.INFO_TYPE
-        req["file_info_class"] = info.INFO_CLASS
-        req["file_id"] = file_open.file_id
-        req["buffer"] = info
-        request = file_open.connection.send(
-            req, file_open.tree_connect.session.session_id,
-            file_open.tree_connect.tree_connect_id)
-        response = file_open.connection.receive(request)
-        resp = SMB2SetInfoResponse()
-        resp.unpack(response["data"].get_value())
+        self._set_info(file_open, info)
 
     def rename(self, old_path, new_path, replace_if_exists=False):
-        with self._lock:
-            return self._with_reconnect(
-                lambda: self._rename(old_path, new_path, replace_if_exists))
+        return self._with_reconnect(
+            lambda: self._rename(old_path, new_path, replace_if_exists))
 
     def _rename(self, old_path, new_path, replace_if_exists):
         file_open = Open(self._tree, old_path)
@@ -431,19 +529,22 @@ class SMBClient:
             info = FileRenameInformation()
             info["replace_if_exists"] = replace_if_exists
             info["file_name"] = new_path
-            req = SMB2SetInfoRequest()
-            req["info_type"] = info.INFO_TYPE
-            req["file_info_class"] = info.INFO_CLASS
-            req["file_id"] = file_open.file_id
-            req["buffer"] = info
-            request = file_open.connection.send(
-                req, file_open.tree_connect.session.session_id,
-                file_open.tree_connect.tree_connect_id)
-            response = file_open.connection.receive(request)
-            resp = SMB2SetInfoResponse()
-            resp.unpack(response["data"].get_value())
+            self._set_info(file_open, info)
         finally:
             try:
                 file_open.close()
             except Exception:
                 pass
+
+    def _set_info(self, file_open, info):
+        req = SMB2SetInfoRequest()
+        req["info_type"] = info.INFO_TYPE
+        req["file_info_class"] = info.INFO_CLASS
+        req["file_id"] = file_open.file_id
+        req["buffer"] = info
+        request = file_open.connection.send(
+            req, file_open.tree_connect.session.session_id,
+            file_open.tree_connect.tree_connect_id)
+        response = file_open.connection.receive(request)
+        resp = SMB2SetInfoResponse()
+        resp.unpack(response["data"].get_value())
