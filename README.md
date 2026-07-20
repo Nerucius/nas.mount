@@ -24,14 +24,18 @@ Windows (local-site)                          client-site LAN
 
 ## Performance
 
-| Method | Reads | Throughput |
-|--------|-----------|------------|
-| rclone SMB (64 KB) | 5.0 MB/s | 40 Mbps |
-| nas-mount single 4 MB | 10.9 MB/s | 87 Mbps |
-| nas-mount pipelined | **12.5 MB/s** | **100 Mbps — line rate** |
+Measured through the real mounts over the WAN (41 ms RTT). The remote site
+is 600 Mbps down / 100 Mbps up, so line rate is 12.5 MB/s for reads and
+~75 MB/s for writes:
 
-Writes: sliding-window pipeline measured at 57 MB/s (458 Mbps) raw; the
-end-to-end TCP ceiling on this path is ~580 Mbps.
+| Platform | Read | Write |
+|----------|------|-------|
+| Windows (Explorer, 2 GB sustained) | **12.8 MB/s** | **76 MB/s (608 Mbps)** |
+| macOS (FUSE-T) | **12.7 MB/s** | 50–54 MB/s |
+| rclone SMB (before) | 5.0 MB/s | ~20 MB/s |
+
+Both directions saturate the link on Windows; macOS reads saturate too and
+writes pay a small NFS-translation tax.
 
 ## Requirements
 

@@ -92,12 +92,13 @@ Writes (ceiling: iperf3 measured 511-581 Mbps end-to-end):
 Depth sweeps showed write_size=4MB/depth=4-6 is the sweet spot; deeper/larger doesn't help.
 SMB signing cannot be disabled client-side (Samba rejects unsigned TreeConnect).
 
-Mounted macOS filesystem (FUSE-T, 2026-07-21, dd 192 MB through ~/nas/media):
+Mounted filesystems, final results (2026-07-21). Line rates: reads capped by
+client-site's 100 Mbps uplink, writes by its 600 Mbps downlink:
 
-| Direction | nas-mount | native macOS SMB | raw engine |
-|-----------|-----------|------------------|------------|
-| Read | **12.7 MB/s (101 Mbps)** | 11.1 | 12.5 |
-| Write | **54.1 MB/s (433 Mbps)** | 42.0 | 57.2 |
+| Platform | Read | Write | Notes |
+|----------|------|-------|-------|
+| Windows (WinFsp, Explorer, 2 GB sustained) | **12.8 MB/s** | **76 MB/s (608 Mbps)** | both directions AT line rate |
+| macOS (FUSE-T, dd 192 MB) | **12.7 MB/s** | 50-54 MB/s | mac writes pay the NFS out-of-order tax; native macOS SMB does 11.1/42 |
 
 Key macOS/FUSE-T lessons (why fs_core is shaped the way it is):
 - FUSE-T = NFSv4 loopback; kernel interleaves its own readahead so reads
