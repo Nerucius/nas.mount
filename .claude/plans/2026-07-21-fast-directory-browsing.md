@@ -65,6 +65,35 @@ silently truncated.
   open refreshed it from the CREATE response). Consistent with what the
   directory listing itself shows.
 
+## Round 2: bulk namespace operations (user-reported)
+
+Reports after round 1: renames look unapplied on Ctrl+R for a bit; folder
+deletion "deletes each file individually and takes forever".
+
+Causes and fixes:
+1. **Kernel enumeration cache rode `file_info_timeout=5000`** → split
+   `dir_info_timeout` (default 1000 ms, `dir_info_timeout_valid=1`).
+2. **Rename was 3 RTTs** (create+set_info+close) → one related compound.
+3. **Delete was 2 RTTs and serial** (the shell deletes folders file-by-file;
+   SMB has no recursive delete) → CREATE(delete-on-close)+CLOSE compound
+   (1 RTT) fired in the background on the shared executor, keyed by parent.
+   Ordering-sensitive ops drain per-parent: rmdir/check_dir_empty, create,
+   rename, cache-miss listing. Directory deletes stay synchronous (they are
+   the natural end-of-batch barrier). `drain_deletes()` wired into both
+   platforms' unmount paths. Worker failure logs + invalidates the parent so
+   the truth resurfaces.
+4. **Every mutation invalidated the parent dir cache**, un-lazying the rest
+   of the batch → surgical cache edits: `_cache_insert_entry` (create),
+   `_cache_update_entry` (dirty close/truncate/overwrite),
+   `_cache_remove_entry` (delete; also plants a negative stat),
+   `_cache_move_entry` (rename). `open_handle` honors fresh negatives (a
+   background delete may be in flight) and seeds lazy handles from fresh
+   positive stat-cache entries.
+
+Measured (30-file folder, live WAN): delete ~10 ms/file (was ~125),
+rename 1 RTT, create+write+close small file 134 ms/file (3 RTTs — data path,
+unchanged). All suites green: 21/21, 19/19, 19/19.
+
 ## Tests
 
 - Both integration suites (winfspy stub 21 checks, fusepy stub 19 checks)

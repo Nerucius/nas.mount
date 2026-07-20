@@ -206,6 +206,11 @@ class FsCore:
         # path it touches; without this each component is a round trip.
         self._stat_cache = {}  # smb_path -> (monotonic_ts, info | None)
         self._cache_lock = threading.Lock()
+        # Pipelined deletes: Explorer deletes folders file-by-file and
+        # serially; running each 1-RTT delete in the background overlaps
+        # them. Keyed by parent so ordering-sensitive ops can drain.
+        self._pending_deletes = {}  # parent_smb -> [Future]
+        self._del_lock = threading.Lock()
         self._readahead_windows = readahead_windows
         self._write_buffer_chunks = write_buffer_chunks
         self.volume_label = volume_label
@@ -260,12 +265,123 @@ class FsCore:
     def invalidate_parent_cache(self, path):
         self.invalidate_cache(self.to_smb_path(self.parent_path(path)))
 
+    # -- surgical cache edits --
+    # Bulk namespace changes (Explorer deleting/copying/renaming hundreds of
+    # files) must not blow away the parent listing per file: that would
+    # un-lazy every subsequent open and turn each probe back into a round
+    # trip. For our OWN mutations we know the outcome - edit the caches in
+    # place and keep them warm.
+
+    @staticmethod
+    def _child_smb_path(parent_smb, name):
+        return f"{parent_smb}\\{name}" if parent_smb else name
+
+    def _cache_remove_entry(self, parent_smb, name):
+        """A path we deleted: drop it from the parent's cached listing,
+        cache the negative stat, drop anything cached beneath it."""
+        name_lower = name.lower()
+        smb_path = self._child_smb_path(parent_smb, name)
+        with self._cache_lock:
+            cached = self._dir_cache.get(parent_smb)
+            if cached:
+                cached[1][:] = [e for e in cached[1]
+                                if e["file_name"].lower() != name_lower]
+            self._dir_cache.pop(smb_path, None)
+            prefix = smb_path + "\\"
+            for key in [k for k in self._stat_cache
+                        if k == smb_path or k.startswith(prefix)]:
+                del self._stat_cache[key]
+            self._stat_cache[smb_path] = (time.monotonic(), None)
+
+    def _cache_insert_entry(self, parent_smb, entry):
+        """A path we created: add it to the parent's cached listing (if
+        one is live) and cache the positive stat."""
+        name_lower = entry["file_name"].lower()
+        smb_path = self._child_smb_path(parent_smb, entry["file_name"])
+        with self._cache_lock:
+            cached = self._dir_cache.get(parent_smb)
+            if cached:
+                cached[1][:] = [e for e in cached[1]
+                                if e["file_name"].lower() != name_lower]
+                cached[1].append(entry)
+                cached[1].sort(key=lambda e: e["file_name"].lower())
+            self._stat_cache[smb_path] = (time.monotonic(), entry)
+
+    def _cache_update_entry(self, handle):
+        """A file we wrote/truncated: refresh size and times in the
+        cached listing and stat cache instead of invalidating them."""
+        smb_path = handle.smb_path
+        parent_smb = smb_path.rsplit("\\", 1)[0] if "\\" in smb_path else ""
+        name_lower = self.file_name(handle.path).lower()
+        with self._cache_lock:
+            cached = self._dir_cache.get(parent_smb)
+            entry = None
+            if cached:
+                for e in cached[1]:
+                    if e["file_name"].lower() == name_lower:
+                        entry = e
+                        break
+            if entry is not None:
+                entry["file_size"] = handle.file_size
+                entry["allocation_size"] = handle.allocation_size
+                entry["file_attributes"] = handle.file_attributes
+                entry["last_write_time"] = handle.last_write_time
+                entry["change_time"] = handle.change_time
+                self._stat_cache[smb_path] = (time.monotonic(), entry)
+            else:
+                self._stat_cache.pop(smb_path, None)
+
+    def _cache_move_entry(self, old_parent_smb, old_name,
+                          new_parent_smb, new_name):
+        """A path we renamed: move the listing entry, drop stale stats."""
+        old_smb = self._child_smb_path(old_parent_smb, old_name)
+        new_smb = self._child_smb_path(new_parent_smb, new_name)
+        old_lower, new_lower = old_name.lower(), new_name.lower()
+        with self._cache_lock:
+            moved = None
+            cached = self._dir_cache.get(old_parent_smb)
+            if cached:
+                for e in cached[1]:
+                    if e["file_name"].lower() == old_lower:
+                        moved = dict(e, file_name=new_name)
+                        break
+                cached[1][:] = [e for e in cached[1]
+                                if e["file_name"].lower() != old_lower]
+            target = self._dir_cache.get(new_parent_smb)
+            if target:
+                target[1][:] = [e for e in target[1]
+                                if e["file_name"].lower() != new_lower]
+                if moved is not None:
+                    target[1].append(moved)
+                    target[1].sort(key=lambda e: e["file_name"].lower())
+                else:
+                    # We know nothing about the moved entry; the target
+                    # listing can no longer be trusted.
+                    self._dir_cache.pop(new_parent_smb, None)
+            # A renamed directory invalidates everything cached beneath
+            # both the old and the new path.
+            for base in (old_smb, new_smb):
+                self._dir_cache.pop(base, None)
+                prefix = base + "\\"
+                for key in [k for k in self._stat_cache
+                            if k == base or k.startswith(prefix)]:
+                    del self._stat_cache[key]
+                for key in [k for k in self._dir_cache
+                            if k.startswith(prefix)]:
+                    del self._dir_cache[key]
+            self._stat_cache[old_smb] = (time.monotonic(), None)
+            if moved is not None:
+                self._stat_cache[new_smb] = (time.monotonic(), moved)
+
     def list_dir(self, smb_path):
         """TTL-cached directory listing, entries in winfsp-style dicts
         (FILETIME timestamps, attribute bits), sorted case-insensitively."""
         cached = self._get_cached_dir(smb_path)
         if cached is not None:
             return cached
+        # A live listing must not resurrect files whose background delete
+        # is still in flight.
+        self._drain_deletes(smb_path)
         raw = self._smb.list_directory(smb_path)
         entries = []
         for item in raw:
@@ -383,6 +499,21 @@ class FsCore:
             )
 
         info = self.lookup_cached(path)
+        if info is None:
+            # The stat cache can answer too: a fresh positive seeds a lazy
+            # handle; a fresh negative (or absence from a fresh parent
+            # listing) is NOT_FOUND without touching the server - a
+            # background delete may still be in flight for this name.
+            with self._cache_lock:
+                entry = self._stat_cache.get(smb_path)
+                if entry and (time.monotonic() - entry[0]) < self._dir_cache_ttl:
+                    info = entry[1]
+                    if info is None:
+                        raise FsError(ErrorCode.NOT_FOUND, path)
+            if info is None:
+                parent_smb = self.to_smb_path(self.parent_path(path))
+                if self._get_cached_dir(parent_smb) is not None:
+                    raise FsError(ErrorCode.NOT_FOUND, path)
         if info:
             is_dir = bool(info["file_attributes"] & FILE_ATTRIBUTE_DIRECTORY)
             return FileHandle(
@@ -458,6 +589,9 @@ class FsCore:
 
     def create_handle(self, path, is_dir, file_attributes=0):
         smb_path = self.to_smb_path(path)
+        # Recreating a name whose background delete is still in flight
+        # must order after the delete.
+        self._drain_deletes(self.to_smb_path(self.parent_path(path)))
         try:
             smb_open = self._smb.create_file(smb_path, is_directory=is_dir)
         except Exception as e:
@@ -482,7 +616,18 @@ class FsCore:
                 creation_time=now, last_access_time=now,
                 last_write_time=now, change_time=now,
             )
-        self.invalidate_parent_cache(path)
+        self._cache_insert_entry(
+            self.to_smb_path(self.parent_path(path)),
+            {
+                "file_name": self.file_name(path),
+                "file_attributes": handle.file_attributes,
+                "file_size": 0,
+                "allocation_size": 0,
+                "creation_time": now,
+                "last_access_time": now,
+                "last_write_time": now,
+                "change_time": now,
+            })
         return handle
 
     def close_handle(self, handle):
@@ -518,14 +663,12 @@ class FsCore:
                 self._smb.close_file(handle.smb_open)
                 handle.smb_open = None
                 handle.writer = None
-        if handle.delete_pending or handle.dirty:
-            # A deleted or modified file makes the parent's cached listing
-            # (names/sizes) stale.
-            smb_path = handle.smb_path
-            if handle.is_directory:
-                self.invalidate_cache(smb_path)
-            parent = smb_path.rsplit("\\", 1)[0] if "\\" in smb_path else ""
-            self.invalidate_cache(parent)
+        if handle.delete_pending:
+            return  # caches were edited surgically at mark_delete time
+        if handle.dirty:
+            # Refresh the written file's size/times in place - a bulk copy
+            # must not blow away the parent listing per file.
+            self._cache_update_entry(handle)
 
     def _close_quietly(self, smb_open, futures):
         """Background close: wait out prefetches that still reference the
@@ -879,7 +1022,7 @@ class FsCore:
                 handle.last_write_time = filetime_now()
                 handle.change_time = handle.last_write_time
                 handle.dirty = True
-            self.invalidate_parent_cache(handle.path)
+            self._cache_update_entry(handle)
         except FsError:
             raise
         except Exception as e:
@@ -903,7 +1046,7 @@ class FsCore:
                     handle.dirty = True
                 handle.allocation_size = new_size
             if not allocation_only:
-                self.invalidate_parent_cache(handle.path)
+                self._cache_update_entry(handle)
         except FsError:
             raise
         except Exception as e:
@@ -913,36 +1056,101 @@ class FsCore:
 
     # -- namespace operations --
 
-    def mark_delete(self, handle, path):
-        """Delete-on-close (Windows cleanup semantics)."""
-        handle.delete_pending = True
-        try:
-            if handle.smb_open is not None:
-                self._smb.set_delete_on_close(handle.smb_open)
-            else:
-                smb_path = self.to_smb_path(path)
-                if handle.is_directory:
-                    self._smb.delete_directory(smb_path)
-                else:
-                    self._smb.delete_file(smb_path)
-        except Exception as e:
-            log.error("cleanup delete(%s) failed: %s", path, e)
+    def _drain_deletes(self, parent_smb):
+        """Wait for in-flight deletes under parent_smb (never called from
+        executor workers - the workers themselves wait on nothing)."""
+        with self._del_lock:
+            futures = self._pending_deletes.pop(parent_smb, None)
+        if futures:
+            for fut in futures:
+                try:
+                    fut.result(timeout=60)
+                except Exception:
+                    pass  # already logged by the worker
 
-    def delete_path(self, path, is_dir):
-        """Direct delete (POSIX unlink/rmdir semantics)."""
-        smb_path = self.to_smb_path(path)
+    def drain_deletes(self):
+        """Wait for every in-flight background delete (unmount/shutdown)."""
+        with self._del_lock:
+            futures = [f for lst in self._pending_deletes.values()
+                       for f in lst]
+            self._pending_deletes.clear()
+        for fut in futures:
+            try:
+                fut.result(timeout=60)
+            except Exception:
+                pass
+
+    def _delete_worker(self, smb_path, parent_smb, is_dir):
         try:
             if is_dir:
                 self._smb.delete_directory(smb_path)
             else:
                 self._smb.delete_file(smb_path)
         except Exception as e:
-            map_smb_error(e)
-        self.invalidate_cache(smb_path)
-        self.invalidate_parent_cache(path)
+            log.error("background delete(%s) failed: %s", smb_path, e)
+            # The surgical cache edit claimed it is gone; let the truth
+            # come back on the next listing.
+            self.invalidate_cache(parent_smb)
+
+    def _submit_delete(self, path, is_dir):
+        """Fire a 1-RTT compound delete in the background. The caches are
+        edited up front so every subsequent lookup/open in a bulk delete
+        stays warm; ordering-sensitive ops drain per-parent."""
+        smb_path = self.to_smb_path(path)
+        parent_smb = self.to_smb_path(self.parent_path(path))
+        self._cache_remove_entry(parent_smb, self.file_name(path))
+        if is_dir:
+            # The server checks emptiness; our children must be gone first.
+            self._drain_deletes(smb_path)
+        fut = self._executor.submit(
+            self._delete_worker, smb_path, parent_smb, is_dir)
+        with self._del_lock:
+            pending = self._pending_deletes.setdefault(parent_smb, [])
+            pending[:] = [f for f in pending if not f.done()]
+            pending.append(fut)
+
+    def _delete_dir_sync(self, path):
+        """Directories delete synchronously - they are rare (one per
+        folder), the server checks emptiness so the children's background
+        deletes must land first, and a completed folder delete must
+        actually be on the server."""
+        smb_path = self.to_smb_path(path)
+        self._drain_deletes(smb_path)
+        self._smb.delete_directory(smb_path)
+        self._cache_remove_entry(
+            self.to_smb_path(self.parent_path(path)),
+            self.file_name(path))
+
+    def mark_delete(self, handle, path):
+        """Delete-on-close (Windows cleanup semantics)."""
+        handle.delete_pending = True
+        try:
+            if handle.smb_open is not None:
+                self._smb.set_delete_on_close(handle.smb_open)
+                parent_smb = self.to_smb_path(self.parent_path(path))
+                self._cache_remove_entry(parent_smb, self.file_name(path))
+            elif handle.is_directory:
+                self._delete_dir_sync(path)
+            else:
+                self._submit_delete(path, is_dir=False)
+        except Exception as e:
+            log.error("cleanup delete(%s) failed: %s", path, e)
+
+    def delete_path(self, path, is_dir):
+        """Direct delete (POSIX unlink/rmdir semantics)."""
+        if is_dir:
+            try:
+                self._delete_dir_sync(path)
+            except FsError:
+                raise
+            except Exception as e:
+                map_smb_error(e)
+        else:
+            self._submit_delete(path, is_dir=False)
 
     def check_dir_empty(self, path):
         smb_path = self.to_smb_path(path)
+        self._drain_deletes(smb_path)
         try:
             entries = self._smb.list_directory(smb_path)
             real = [e for e in entries if e["file_name"] not in (".", "..")]
@@ -956,22 +1164,23 @@ class FsCore:
     def rename(self, handle, old_path, new_path, replace_if_exists):
         old_smb = self.to_smb_path(old_path)
         new_smb = self.to_smb_path(new_path)
+        old_parent = self.to_smb_path(self.parent_path(old_path))
+        new_parent = self.to_smb_path(self.parent_path(new_path))
         try:
             if handle is not None:
                 with handle.io_lock:
                     self._drain_writes(handle)
+            # A pending delete of either name must land before we move.
+            self._drain_deletes(old_parent)
+            if new_parent != old_parent:
+                self._drain_deletes(new_parent)
             self._smb.rename(old_smb, new_smb,
                              replace_if_exists=replace_if_exists)
             if handle is not None:
                 handle.path = new_path
                 handle.smb_path = new_smb
-            self.invalidate_cache(old_smb)
-            self.invalidate_cache(new_smb)
-            old_parent = self.to_smb_path(self.parent_path(old_path))
-            new_parent = self.to_smb_path(self.parent_path(new_path))
-            self.invalidate_cache(old_parent)
-            if new_parent != old_parent:
-                self.invalidate_cache(new_parent)
+            self._cache_move_entry(old_parent, self.file_name(old_path),
+                                   new_parent, self.file_name(new_path))
         except FsError:
             raise
         except Exception as e:

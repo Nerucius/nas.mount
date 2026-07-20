@@ -652,35 +652,61 @@ class SMBClient:
         return self._with_reconnect(lambda: self._delete_file(path))
 
     def _delete_file(self, path):
-        file_open = Open(self._tree, path)
-        file_open.create(
-            ImpersonationLevel.Impersonation,
+        self._compound_delete(
+            path,
             FilePipePrinterAccessMask.DELETE,
             FileAttributes.FILE_ATTRIBUTE_NORMAL,
-            # Full share access: this open only sets delete-on-close, and a
-            # background close of a read handle may still be in flight.
-            ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE
-            | ShareAccess.FILE_SHARE_DELETE,
-            CreateDisposition.FILE_OPEN,
-            CreateOptions.FILE_DELETE_ON_CLOSE | CreateOptions.FILE_NON_DIRECTORY_FILE,
+            CreateOptions.FILE_DELETE_ON_CLOSE
+            | CreateOptions.FILE_NON_DIRECTORY_FILE,
         )
-        file_open.close()
 
     def delete_directory(self, path):
         return self._with_reconnect(lambda: self._delete_directory(path))
 
     def _delete_directory(self, path):
-        dir_open = Open(self._tree, path)
-        dir_open.create(
-            ImpersonationLevel.Impersonation,
+        self._compound_delete(
+            path,
             DirectoryAccessMask.DELETE,
             FileAttributes.FILE_ATTRIBUTE_DIRECTORY,
+            CreateOptions.FILE_DELETE_ON_CLOSE
+            | CreateOptions.FILE_DIRECTORY_FILE,
+        )
+
+    def _compound_delete(self, path, access, attrs, options):
+        # CREATE(delete-on-close) + CLOSE as one related compound: a delete
+        # is one round trip. Full share access - this open only tags the
+        # file, and a background close of a read handle may still be in
+        # flight. The CLOSE performs the deletion, so its status matters.
+        file_open = Open(self._tree, path)
+        create_msg, create_recv = file_open.create(
+            ImpersonationLevel.Impersonation,
+            access,
+            attrs,
             ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE
             | ShareAccess.FILE_SHARE_DELETE,
             CreateDisposition.FILE_OPEN,
-            CreateOptions.FILE_DELETE_ON_CLOSE | CreateOptions.FILE_DIRECTORY_FILE,
+            options,
+            send=False,
         )
-        dir_open.close()
+        close_msg, close_recv = file_open.close(send=False)
+        requests = self._connection.send_compound(
+            [create_msg, close_msg],
+            self._session.session_id, self._tree.tree_connect_id,
+            related=True,
+        )
+        create_exc = close_exc = None
+        try:
+            create_recv(requests[0])
+        except Exception as e:
+            create_exc = e
+        try:
+            close_recv(requests[1])
+        except Exception as e:
+            close_exc = e
+        if create_exc is not None:
+            raise create_exc
+        if close_exc is not None:
+            raise close_exc
 
     def set_end_of_file(self, file_open, size):
         return self._with_reconnect(
@@ -696,27 +722,51 @@ class SMBClient:
             lambda: self._rename(old_path, new_path, replace_if_exists))
 
     def _rename(self, old_path, new_path, replace_if_exists):
+        # CREATE + SET_INFO(rename) + CLOSE as one related compound: a
+        # rename is one round trip (was three).
         file_open = Open(self._tree, old_path)
+        create_msg, create_recv = file_open.create(
+            ImpersonationLevel.Impersonation,
+            FilePipePrinterAccessMask.DELETE
+            | FilePipePrinterAccessMask.FILE_READ_ATTRIBUTES,
+            FileAttributes.FILE_ATTRIBUTE_NORMAL,
+            ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE
+            | ShareAccess.FILE_SHARE_DELETE,
+            CreateDisposition.FILE_OPEN,
+            0,
+            send=False,
+        )
+        info = FileRenameInformation()
+        info["replace_if_exists"] = replace_if_exists
+        info["file_name"] = new_path
+        set_req = SMB2SetInfoRequest()
+        set_req["info_type"] = info.INFO_TYPE
+        set_req["file_info_class"] = info.INFO_CLASS
+        set_req["file_id"] = file_open.file_id  # related-compound sentinel
+        set_req["buffer"] = info
+        close_msg, close_recv = file_open.close(send=False)
+        requests = self._connection.send_compound(
+            [create_msg, set_req, close_msg],
+            self._session.session_id, self._tree.tree_connect_id,
+            related=True,
+        )
+        create_exc = set_exc = None
         try:
-            file_open.create(
-                ImpersonationLevel.Impersonation,
-                FilePipePrinterAccessMask.DELETE
-                | FilePipePrinterAccessMask.FILE_READ_ATTRIBUTES,
-                FileAttributes.FILE_ATTRIBUTE_NORMAL,
-                ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE
-                | ShareAccess.FILE_SHARE_DELETE,
-                CreateDisposition.FILE_OPEN,
-                0,
-            )
-            info = FileRenameInformation()
-            info["replace_if_exists"] = replace_if_exists
-            info["file_name"] = new_path
-            self._set_info(file_open, info)
-        finally:
-            try:
-                file_open.close()
-            except Exception:
-                pass
+            create_recv(requests[0])
+        except Exception as e:
+            create_exc = e
+        try:
+            self._connection.receive(requests[1])
+        except Exception as e:
+            set_exc = e
+        try:
+            close_recv(requests[2])
+        except Exception:
+            pass
+        if create_exc is not None:
+            raise create_exc
+        if set_exc is not None:
+            raise set_exc
 
     def _set_info(self, file_open, info):
         req = SMB2SetInfoRequest()

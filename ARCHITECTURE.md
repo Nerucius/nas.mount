@@ -79,6 +79,18 @@ Linux autotuning stays active).
   256 KB head instead of a full 4 MB window (upgraded in place if reading
   continues), so a folder of images doesn't pull megabytes per thumbnail probe.
   Clean read-only handles close in the background (no close RTT on the caller).
+- **Surgical cache edits + pipelined deletes** — bulk namespace changes
+  (Explorer deleting/copying/renaming hundreds of files) edit the caches in
+  place instead of invalidating the parent per file, so every subsequent
+  lookup/open in the batch stays warm. Deletes are 1-RTT compounds
+  (CREATE+CLOSE with delete-on-close) fired in the background and keyed by
+  parent; ordering-sensitive ops (rmdir, create, rename, live listing) drain
+  per-parent first, and directory deletes are synchronous so a finished
+  folder delete is really on the server. Renames are CREATE+SET_INFO+CLOSE
+  compounds (1 RTT). Measured: folder of 30 files deletes at ~10 ms/file vs
+  ~125 ms/file before. `dir_info_timeout` (default 1000 ms) is split from
+  `file_info_timeout` so the kernel's enumeration cache can't show a rename
+  or delete as unapplied for seconds.
 - **Cheap cold opens** — open() consults the dir cache only; on a miss it opens
   the SMB handle directly (the create response carries all metadata) instead of
   listing the whole parent directory first.

@@ -322,6 +322,10 @@ def run_mount(config, debug=False):
                 volume_creation_time=0,
                 volume_serial_number=0,
                 file_info_timeout=tuning.get("file_info_timeout", 5000),
+                # Enumerations must not ride the long file-info cache, or
+                # renames/deletes look unapplied on refresh for seconds.
+                dir_info_timeout_valid=1,
+                dir_info_timeout=tuning.get("dir_info_timeout", 1000),
                 case_sensitive_search=0,
                 case_preserved_names=1,
                 unicode_on_disk=1,
@@ -352,6 +356,7 @@ def run_mount(config, debug=False):
             try:
                 print(f"  Unmounting {mountpoint}...", end=" ", flush=True)
                 fs.stop()
+                ops.core.drain_deletes()
                 print("OK")
             except Exception as e:
                 print(f"FAILED ({e})")
@@ -375,6 +380,7 @@ def run_mount_macos(config, debug=False):
 
     clients_by_share = {}
     mounted = []  # (mountpoint, thread)
+    mounted_ops = []
 
     print("=" * 60)
     print("  nas-mount (macOS)")
@@ -425,6 +431,7 @@ def run_mount_macos(config, debug=False):
             )
             t.start()
             mounted.append((mountpoint, t))
+            mounted_ops.append(ops)
 
         print(f"\n  {len(mounted)} mount(s) active. Press Ctrl+C to stop.")
         print("=" * 60)
@@ -450,6 +457,11 @@ def run_mount_macos(config, debug=False):
                                    capture_output=True, text=True)
                 t.join(timeout=10)
                 print("OK" if not t.is_alive() else "STUCK")
+        for ops in mounted_ops:
+            try:
+                ops.core.drain_deletes()
+            except Exception:
+                pass
         for client in clients_by_share.values():
             try:
                 client.disconnect()
