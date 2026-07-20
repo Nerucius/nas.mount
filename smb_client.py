@@ -43,6 +43,13 @@ EPOCH_AS_FILETIME = 116444736000000000  # 1601-01-01 in 100ns ticks
 
 STATUS_END_OF_FILE = 0xC0000011
 
+# Directory-listing query buffer. One 1 MB page holds any directory whose
+# worst-case-encoded entries fit (FILE_BOTH_DIRECTORY_INFORMATION is at most
+# ~608 bytes/entry), so a listing under LIST_SAFE_ENTRIES entries returned by
+# a single query is provably complete without a second round trip.
+LIST_PAGE_SIZE = 1048576
+LIST_SAFE_ENTRIES = 1600
+
 # Errors that mean the TCP connection (or the SMB session on it) is gone.
 CONNECTION_ERRORS = (SMBConnectionClosed, ConnectionError, BrokenPipeError,
                      TimeoutError, OSError)
@@ -329,7 +336,73 @@ class SMBClient:
     def list_directory(self, path=""):
         return self._with_reconnect(lambda: self._list_directory(path))
 
+    @staticmethod
+    def _dir_entry(entry):
+        return {
+            "file_name": entry["file_name"].get_value().decode("utf-16-le"),
+            "file_attributes": entry["file_attributes"].get_value(),
+            "end_of_file": entry["end_of_file"].get_value(),
+            "allocation_size": entry["allocation_size"].get_value(),
+            "creation_time": entry["creation_time"].get_value(),
+            "last_access_time": entry["last_access_time"].get_value(),
+            "last_write_time": entry["last_write_time"].get_value(),
+            "change_time": entry["change_time"].get_value(),
+        }
+
     def _list_directory(self, path):
+        # CREATE + QUERY_DIRECTORY + CLOSE as one related compound: a full
+        # listing costs a single round trip. Only when the single page
+        # cannot be proven complete (LIST_SAFE_ENTRIES) re-list paged.
+        dir_open = Open(self._tree, path)
+        create_msg, create_recv = dir_open.create(
+            ImpersonationLevel.Impersonation,
+            DirectoryAccessMask.FILE_LIST_DIRECTORY
+            | DirectoryAccessMask.FILE_READ_ATTRIBUTES,
+            FileAttributes.FILE_ATTRIBUTE_DIRECTORY,
+            ShareAccess.FILE_SHARE_READ,
+            CreateDisposition.FILE_OPEN,
+            CreateOptions.FILE_DIRECTORY_FILE,
+            send=False,
+        )
+        query_msg, query_recv = dir_open.query_directory(
+            "*", FileInformationClass.FILE_BOTH_DIRECTORY_INFORMATION,
+            max_output=LIST_PAGE_SIZE, send=False,
+        )
+        close_msg, close_recv = dir_open.close(send=False)
+        requests = self._connection.send_compound(
+            [create_msg, query_msg, close_msg],
+            self._session.session_id, self._tree.tree_connect_id,
+            related=True,
+        )
+        # All three responses must be consumed even when the create fails,
+        # or they linger in the connection's outstanding-request table.
+        create_exc = query_exc = None
+        raw = []
+        try:
+            create_recv(requests[0])
+        except Exception as e:
+            create_exc = e
+        try:
+            raw = query_recv(requests[1])
+        except NoMoreFiles:
+            pass
+        except Exception as e:
+            query_exc = e
+        try:
+            close_recv(requests[2])
+        except Exception:
+            pass
+        if create_exc is not None:
+            raise create_exc
+        if query_exc is not None:
+            raise query_exc
+        if len(raw) >= LIST_SAFE_ENTRIES:
+            return self._list_directory_paged(path)
+        return [self._dir_entry(e) for e in raw]
+
+    def _list_directory_paged(self, path):
+        """Huge-directory path: page through query_directory until
+        NoMoreFiles (a single query returns at most one buffer's worth)."""
         dir_open = Open(self._tree, path)
         try:
             dir_open.create(
@@ -342,23 +415,15 @@ class SMBClient:
                 CreateOptions.FILE_DIRECTORY_FILE,
             )
             entries = []
-            try:
-                raw = dir_open.query_directory(
-                    "*", FileInformationClass.FILE_BOTH_DIRECTORY_INFORMATION)
-                for entry in raw:
-                    name = entry["file_name"].get_value().decode("utf-16-le")
-                    entries.append({
-                        "file_name": name,
-                        "file_attributes": entry["file_attributes"].get_value(),
-                        "end_of_file": entry["end_of_file"].get_value(),
-                        "allocation_size": entry["allocation_size"].get_value(),
-                        "creation_time": entry["creation_time"].get_value(),
-                        "last_access_time": entry["last_access_time"].get_value(),
-                        "last_write_time": entry["last_write_time"].get_value(),
-                        "change_time": entry["change_time"].get_value(),
-                    })
-            except NoMoreFiles:
-                pass
+            while True:
+                try:
+                    raw = dir_open.query_directory(
+                        "*",
+                        FileInformationClass.FILE_BOTH_DIRECTORY_INFORMATION,
+                        max_output=LIST_PAGE_SIZE)
+                except NoMoreFiles:
+                    break
+                entries.extend(self._dir_entry(e) for e in raw)
             return entries
         finally:
             try:
@@ -370,41 +435,46 @@ class SMBClient:
         return self._with_reconnect(lambda: self._stat_path(path))
 
     def _stat_path(self, path):
-        is_root = path == "" or path == "\\"
+        # CREATE + CLOSE as one related compound - the create response
+        # carries all the metadata, so a stat (hit or miss) is one round
+        # trip. CreateOptions=0 opens files and directories alike.
         file_open = Open(self._tree, path)
+        create_msg, create_recv = file_open.create(
+            ImpersonationLevel.Impersonation,
+            FilePipePrinterAccessMask.FILE_READ_ATTRIBUTES,
+            FileAttributes.FILE_ATTRIBUTE_NORMAL,
+            ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE
+            | ShareAccess.FILE_SHARE_DELETE,
+            CreateDisposition.FILE_OPEN,
+            0,
+            send=False,
+        )
+        close_msg, close_recv = file_open.close(send=False)
+        requests = self._connection.send_compound(
+            [create_msg, close_msg],
+            self._session.session_id, self._tree.tree_connect_id,
+            related=True,
+        )
+        create_exc = None
         try:
-            if is_root:
-                file_open.create(
-                    ImpersonationLevel.Impersonation,
-                    DirectoryAccessMask.FILE_READ_ATTRIBUTES,
-                    FileAttributes.FILE_ATTRIBUTE_DIRECTORY,
-                    ShareAccess.FILE_SHARE_READ,
-                    CreateDisposition.FILE_OPEN,
-                    CreateOptions.FILE_DIRECTORY_FILE,
-                )
-            else:
-                file_open.create(
-                    ImpersonationLevel.Impersonation,
-                    FilePipePrinterAccessMask.FILE_READ_ATTRIBUTES,
-                    FileAttributes.FILE_ATTRIBUTE_NORMAL,
-                    ShareAccess.FILE_SHARE_READ,
-                    CreateDisposition.FILE_OPEN,
-                    0,
-                )
-            return {
-                "file_attributes": file_open.file_attributes,
-                "end_of_file": file_open.end_of_file,
-                "allocation_size": file_open.allocation_size,
-                "creation_time": file_open.creation_time,
-                "last_access_time": file_open.last_access_time,
-                "last_write_time": file_open.last_write_time,
-                "change_time": file_open.change_time,
-            }
-        finally:
-            try:
-                file_open.close()
-            except Exception:
-                pass
+            create_recv(requests[0])
+        except Exception as e:
+            create_exc = e
+        try:
+            close_recv(requests[1])
+        except Exception:
+            pass
+        if create_exc is not None:
+            raise create_exc
+        return {
+            "file_attributes": file_open.file_attributes,
+            "end_of_file": file_open.end_of_file,
+            "allocation_size": file_open.allocation_size,
+            "creation_time": file_open.creation_time,
+            "last_access_time": file_open.last_access_time,
+            "last_write_time": file_open.last_write_time,
+            "change_time": file_open.change_time,
+        }
 
     def query_volume_info(self):
         return self._with_reconnect(self._query_volume_info)
@@ -452,8 +522,8 @@ class SMBClient:
         return self._with_reconnect(
             lambda: self._open_file(path, read, write))
 
-    def _open_file(self, path, read, write):
-        file_open = Open(self._tree, path)
+    @staticmethod
+    def _file_access_mask(read, write):
         access = FilePipePrinterAccessMask.DELETE
         if read:
             access |= (FilePipePrinterAccessMask.FILE_READ_DATA
@@ -462,9 +532,13 @@ class SMBClient:
             access |= (FilePipePrinterAccessMask.FILE_WRITE_DATA
                        | FilePipePrinterAccessMask.FILE_WRITE_ATTRIBUTES
                        | FilePipePrinterAccessMask.FILE_APPEND_DATA)
+        return access
+
+    def _open_file(self, path, read, write):
+        file_open = Open(self._tree, path)
         file_open.create(
             ImpersonationLevel.Impersonation,
-            access,
+            self._file_access_mask(read, write),
             FileAttributes.FILE_ATTRIBUTE_NORMAL,
             ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE
             | ShareAccess.FILE_SHARE_DELETE,
@@ -472,6 +546,55 @@ class SMBClient:
             CreateOptions.FILE_NON_DIRECTORY_FILE,
         )
         return file_open
+
+    def open_and_read(self, path, length, write=False):
+        return self._with_reconnect(
+            lambda: self._open_and_read(path, length, write))
+
+    def _open_and_read(self, path, length, write):
+        # CREATE + READ(head) as one related compound: opening a file and
+        # sniffing its header - Explorer's per-file pattern - costs a
+        # single round trip instead of two.
+        file_open = Open(self._tree, path)
+        create_msg, create_recv = file_open.create(
+            ImpersonationLevel.Impersonation,
+            self._file_access_mask(True, write),
+            FileAttributes.FILE_ATTRIBUTE_NORMAL,
+            ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE
+            | ShareAccess.FILE_SHARE_DELETE,
+            CreateDisposition.FILE_OPEN,
+            CreateOptions.FILE_NON_DIRECTORY_FILE,
+            send=False,
+        )
+        read_msg, read_recv = file_open.read(0, length, send=False)
+        requests = self._connection.send_compound(
+            [create_msg, read_msg],
+            self._session.session_id, self._tree.tree_connect_id,
+            related=True,
+        )
+        create_exc = read_exc = None
+        try:
+            create_recv(requests[0])
+        except Exception as e:
+            create_exc = e
+        data = b""
+        try:
+            data = read_recv(requests[1])
+        except SMBResponseException as e:
+            # Reading past EOF (empty file) is fine - the open still counts.
+            if e.status != STATUS_END_OF_FILE:
+                read_exc = e
+        except Exception as e:
+            read_exc = e
+        if create_exc is not None:
+            raise create_exc
+        if read_exc is not None:
+            try:
+                file_open.close()
+            except Exception:
+                pass
+            raise read_exc
+        return file_open, bytes(data)
 
     def set_delete_on_close(self, file_open):
         return self._with_reconnect(
@@ -534,7 +657,10 @@ class SMBClient:
             ImpersonationLevel.Impersonation,
             FilePipePrinterAccessMask.DELETE,
             FileAttributes.FILE_ATTRIBUTE_NORMAL,
-            ShareAccess.FILE_SHARE_DELETE,
+            # Full share access: this open only sets delete-on-close, and a
+            # background close of a read handle may still be in flight.
+            ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE
+            | ShareAccess.FILE_SHARE_DELETE,
             CreateDisposition.FILE_OPEN,
             CreateOptions.FILE_DELETE_ON_CLOSE | CreateOptions.FILE_NON_DIRECTORY_FILE,
         )
@@ -549,7 +675,8 @@ class SMBClient:
             ImpersonationLevel.Impersonation,
             DirectoryAccessMask.DELETE,
             FileAttributes.FILE_ATTRIBUTE_DIRECTORY,
-            ShareAccess.FILE_SHARE_DELETE | ShareAccess.FILE_SHARE_READ,
+            ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE
+            | ShareAccess.FILE_SHARE_DELETE,
             CreateDisposition.FILE_OPEN,
             CreateOptions.FILE_DELETE_ON_CLOSE | CreateOptions.FILE_DIRECTORY_FILE,
         )

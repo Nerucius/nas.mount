@@ -37,6 +37,12 @@ is 600 Mbps down / 100 Mbps up, so line rate is 12.5 MB/s for reads and
 Both directions saturate the link on Windows; macOS reads saturate too and
 writes pay a small NFS-translation tax.
 
+Directory browsing is metadata-bound (41 ms per round trip), so metadata
+operations are SMB2-compounded (stat and full listings each cost one round
+trip), negative probes and repeated stats are cached, file opens are lazy,
+and header sniffs read a 256 KB head instead of a full 4 MB window. A folder
+of images paints instantly warm, ~0.3 s cold.
+
 ## Requirements
 
 - Windows 10/11 with [WinFsp](https://winfsp.dev/), **or** macOS with
@@ -76,7 +82,8 @@ user = "herman"
 [tuning]
 read_size = 4194304    # 4 MB — proven optimal for 37ms RTT
 write_size = 4194304
-dir_cache_ttl = 300    # seconds
+dir_cache_ttl = 300       # seconds
+file_info_timeout = 5000  # ms the Windows kernel caches metadata
 
 [mounts]
 M = "storage/media"

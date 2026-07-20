@@ -13,6 +13,7 @@ readahead_windows = 2      # background prefetch windows per file
 readahead_workers = 8      # shared prefetch thread pool size
 write_buffer_chunks = 3    # coalescer pressure limit, in write_size units
 dir_cache_ttl = 300        # directory listing cache in seconds
+file_info_timeout = 5000   # ms the Windows kernel caches file metadata (WinFsp)
 reconnect_delay = 5        # seconds before reconnect attempt
 max_reconnect_attempts = 10
 

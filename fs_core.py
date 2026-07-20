@@ -40,6 +40,11 @@ FILE_ATTRIBUTE_NORMAL = 0x80
 
 STATUS_FILE_IS_A_DIRECTORY = 0xC00000BA
 
+# First-touch small reads fetch this much instead of a full read_size
+# window (Explorer sniffs the header of every file in a folder; covers
+# EXIF/PNG/JPEG headers and media probes with room to spare).
+HEAD_FETCH_SIZE = 262144
+
 
 def filetime_now():
     return EPOCH_AS_FILETIME + int(time.time() * 10_000_000)
@@ -127,17 +132,21 @@ class FileHandle:
                  "file_attributes", "file_size", "allocation_size",
                  "creation_time", "last_access_time", "last_write_time",
                  "change_time", "io_lock",
-                 "ra_windows", "ra_futures",
-                 "writer", "wsegs", "delete_pending", "dirty")
+                 "ra_windows", "ra_futures", "ra_partial",
+                 "writer", "wsegs", "delete_pending", "dirty",
+                 "want_write")
 
     def __init__(self, path, smb_path, smb_open=None, is_directory=False,
                  file_attributes=0, file_size=0, allocation_size=0,
                  creation_time=0, last_access_time=0, last_write_time=0,
-                 change_time=0):
+                 change_time=0, want_write=False):
         self.path = path
         self.smb_path = smb_path
         self.smb_open = smb_open
         self.is_directory = is_directory
+        # Lazy open: a cache-hit open defers the SMB CREATE until the first
+        # data operation; want_write records the access to open with then.
+        self.want_write = want_write
         self.file_attributes = file_attributes
         self.file_size = file_size
         self.allocation_size = allocation_size
@@ -154,6 +163,7 @@ class FileHandle:
         # keeping several completed windows makes that pattern all-hits.
         self.ra_windows = OrderedDict()  # window_start -> bytes (LRU)
         self.ra_futures = {}             # window_start -> Future(bytes)
+        self.ra_partial = set()          # windows holding only a head fetch
         # Write-behind state: out-of-order-tolerant segment coalescer +
         # pipelined writer. Kernel clients (NFS writeback, overlapped I/O)
         # deliver writes out of order; segments absorb that and only full
@@ -191,6 +201,10 @@ class FsCore:
         self._subpath = subpath.replace("/", "\\")
         self._dir_cache_ttl = dir_cache_ttl
         self._dir_cache = {}
+        # Positive AND negative stat results (info dict or None), same TTL
+        # as the dir cache. Explorer re-walks the ancestor chain of every
+        # path it touches; without this each component is a round trip.
+        self._stat_cache = {}  # smb_path -> (monotonic_ts, info | None)
         self._cache_lock = threading.Lock()
         self._readahead_windows = readahead_windows
         self._write_buffer_chunks = write_buffer_chunks
@@ -236,6 +250,12 @@ class FsCore:
     def invalidate_cache(self, smb_path):
         with self._cache_lock:
             self._dir_cache.pop(smb_path, None)
+            # Drop stat entries for the path itself and everything below it
+            # (covers children of a changed dir and renamed/deleted trees).
+            prefix = smb_path + "\\" if smb_path else ""
+            for key in [k for k in self._stat_cache
+                        if k == smb_path or k.startswith(prefix)]:
+                del self._stat_cache[key]
 
     def invalidate_parent_cache(self, path):
         self.invalidate_cache(self.to_smb_path(self.parent_path(path)))
@@ -278,16 +298,6 @@ class FsCore:
                 return entry
         return None
 
-    def lookup(self, path):
-        """Lookup via parent listing (fills the cache); None if missing."""
-        parent_smb = self.to_smb_path(self.parent_path(path))
-        entries = self.list_dir(parent_smb)
-        name_lower = self.file_name(path).lower()
-        for entry in entries:
-            if entry["file_name"].lower() == name_lower:
-                return entry
-        return None
-
     def stat(self, path):
         """Direct SMB stat; None if the path does not exist."""
         smb_path = self.to_smb_path(path)
@@ -306,11 +316,27 @@ class FsCore:
             return None
 
     def lookup_or_stat(self, path):
-        """Best metadata available without opening: dir cache/parent
-        listing first, direct stat as fallback. None if missing."""
-        info = self.lookup(path)
-        if info is None:
-            info = self.stat(path)
+        """Best metadata available without opening. A fresh parent listing
+        is authoritative for absence too - Explorer probes desktop.ini/
+        Thumbs.db on every folder visit and each miss must not cost a round
+        trip. Never lists the parent on a cache miss (it may be huge when
+        all we need is one child); a direct stat is a single round trip."""
+        cached = self.lookup_cached(path)
+        if cached is not None:
+            return cached
+        parent_smb = self.to_smb_path(self.parent_path(path))
+        if self._get_cached_dir(parent_smb) is not None:
+            return None
+        smb_path = self.to_smb_path(path)
+        with self._cache_lock:
+            entry = self._stat_cache.get(smb_path)
+            if entry and (time.monotonic() - entry[0]) < self._dir_cache_ttl:
+                return entry[1]
+        info = self.stat(path)
+        with self._cache_lock:
+            if len(self._stat_cache) > 4096:
+                self._stat_cache.clear()
+            self._stat_cache[smb_path] = (time.monotonic(), info)
         return info
 
     # -- volume info --
@@ -337,9 +363,12 @@ class FsCore:
     # -- open/create/close --
 
     def open_handle(self, path, want_write, dir_hint=False):
-        """Open a handle. Cache-only lookup first; on a miss, open the SMB
-        file directly (the create response carries all metadata) and fall
-        back to directory semantics on STATUS_FILE_IS_A_DIRECTORY.
+        """Open a handle. A cache hit (file or directory) opens with zero
+        round trips: the SMB CREATE for files is deferred to the first data
+        operation (_ensure_open) - most opens only ever read the attributes
+        we already have. On a miss, open the SMB file directly (the create
+        response carries all metadata) and fall back to directory semantics
+        on STATUS_FILE_IS_A_DIRECTORY.
         dir_hint: caller believes this is a directory (cache-miss only)."""
         smb_path = self.to_smb_path(path)
 
@@ -356,9 +385,20 @@ class FsCore:
         info = self.lookup_cached(path)
         if info:
             is_dir = bool(info["file_attributes"] & FILE_ATTRIBUTE_DIRECTORY)
-        else:
-            is_dir = dir_hint
+            return FileHandle(
+                path=path, smb_path=smb_path, smb_open=None,
+                is_directory=is_dir,
+                file_attributes=info["file_attributes"],
+                file_size=info["file_size"],
+                allocation_size=info["allocation_size"],
+                creation_time=info["creation_time"],
+                last_access_time=info["last_access_time"],
+                last_write_time=info["last_write_time"],
+                change_time=info["change_time"],
+                want_write=want_write,
+            )
 
+        is_dir = dir_hint
         smb_open = None
         if not is_dir:
             try:
@@ -385,22 +425,11 @@ class FsCore:
                 last_access_time=smb_dt_to_filetime(smb_open.last_access_time),
                 last_write_time=smb_dt_to_filetime(smb_open.last_write_time),
                 change_time=smb_dt_to_filetime(smb_open.change_time),
+                want_write=want_write,
             )
-        if info:
-            return FileHandle(
-                path=path, smb_path=smb_path, smb_open=None,
-                is_directory=is_dir,
-                file_attributes=info["file_attributes"],
-                file_size=info["file_size"],
-                allocation_size=info["allocation_size"],
-                creation_time=info["creation_time"],
-                last_access_time=info["last_access_time"],
-                last_write_time=info["last_write_time"],
-                change_time=info["change_time"],
-            )
-        # Directory (or file we could not open as file): stat for real
-        # metadata.
-        st = self.stat(path)
+        # Directory (or file we could not open as file): best metadata
+        # available (stat cache/fresh parent listing/1-RTT stat).
+        st = self.lookup_or_stat(path)
         if st is None:
             raise FsError(ErrorCode.NOT_FOUND, path)
         return FileHandle(
@@ -413,7 +442,19 @@ class FsCore:
             last_access_time=st["last_access_time"],
             last_write_time=st["last_write_time"],
             change_time=st["change_time"],
+            want_write=want_write,
         )
+
+    def _ensure_open(self, handle):
+        """Materialize a lazily-opened handle (call with io_lock held).
+        The create response is authoritative for size - the handle was
+        built from a possibly-stale cached listing."""
+        if handle.smb_open is not None or handle.is_directory:
+            return
+        handle.smb_open = self._smb.open_file(handle.smb_path, read=True,
+                                              write=handle.want_write)
+        handle.file_size = handle.smb_open.end_of_file
+        handle.allocation_size = handle.smb_open.allocation_size
 
     def create_handle(self, path, is_dir, file_attributes=0):
         smb_path = self.to_smb_path(path)
@@ -446,6 +487,24 @@ class FsCore:
 
     def close_handle(self, handle):
         with handle.io_lock:
+            if (handle.smb_open is not None
+                    and not handle.delete_pending and not handle.dirty):
+                # Clean read-only handle: nothing to drain and nobody
+                # depends on close ordering - release the caller now and
+                # close in the background (after any in-flight prefetches
+                # let go of the SMB handle). Explorer closes a handle per
+                # file it sniffs; a synchronous close is a round trip each.
+                futures = list(handle.ra_futures.values())
+                for fut in futures:
+                    fut.cancel()
+                handle.ra_futures = {}
+                handle.ra_windows = OrderedDict()
+                handle.ra_partial = set()
+                smb_open = handle.smb_open
+                handle.smb_open = None
+                self._executor.submit(self._close_quietly, smb_open,
+                                      futures)
+                return
             self._drop_readahead(handle, wait=True)
             if handle.smb_open is not None:
                 if handle.delete_pending:
@@ -467,6 +526,21 @@ class FsCore:
                 self.invalidate_cache(smb_path)
             parent = smb_path.rsplit("\\", 1)[0] if "\\" in smb_path else ""
             self.invalidate_cache(parent)
+
+    def _close_quietly(self, smb_open, futures):
+        """Background close: wait out prefetches that still reference the
+        SMB handle (only ones already running - cancelled ones never ran),
+        then close, swallowing errors (the handle is gone either way)."""
+        for fut in futures:
+            if not fut.cancelled():
+                try:
+                    fut.result(timeout=60)
+                except Exception:
+                    pass
+        try:
+            self._smb.close_file(smb_open)
+        except Exception as e:
+            log.debug("async close: %s", e)
 
     # -- write-behind plumbing (call with handle.io_lock held) --
 
@@ -588,26 +662,51 @@ class FsCore:
         handle.ra_futures[wstart] = self._executor.submit(
             self._fetch_window, handle, wstart)
 
-    def _get_window(self, handle, wstart):
-        """Return the window's bytes: LRU cache hit, in-flight future, or
-        synchronous fetch. Completed windows enter the LRU (old ones age
-        out - no purging, so out-of-order nearby reads always hit)."""
+    def _get_window(self, handle, wstart, need):
+        """Return at least `need` bytes of the window at wstart: LRU cache
+        hit, in-flight future, or synchronous fetch. Completed windows
+        enter the LRU (old ones age out - no purging, so out-of-order
+        nearby reads always hit).
+
+        First touch of a file with a small read fetches only a head chunk
+        instead of the full window: Explorer/media apps sniff headers of
+        every file in a folder, and pulling a full window per sniff turns
+        a 64 KB probe into megabytes of WAN traffic. The head upgrades to
+        the full window as soon as reading continues past it."""
+        expected = min(self._window_size(), handle.file_size - wstart)
         cached = handle.ra_windows.get(wstart)
-        if cached is not None:
+        if cached is not None and (wstart not in handle.ra_partial
+                                   or len(cached) >= need):
             handle.ra_windows.move_to_end(wstart)
             return cached
         fut = handle.ra_futures.pop(wstart, None)
         if fut is not None:
             data = fut.result()
+        elif cached is not None:
+            # Deliberate head fetch, now being read past: complete it.
+            tail = self._smb.read_file_pipelined(
+                handle.smb_open, wstart + len(cached), expected - len(cached))
+            data = bytes(cached) + tail
+        elif (not handle.ra_windows and not handle.ra_futures
+                and need <= HEAD_FETCH_SIZE < expected):
+            data = self._smb.read_file_pipelined(
+                handle.smb_open, wstart, HEAD_FETCH_SIZE)
+            handle.ra_windows[wstart] = data
+            handle.ra_partial.add(wstart)
+            return data
         else:
             data = self._fetch_window(handle, wstart)
+        handle.ra_partial.discard(wstart)
         handle.ra_windows[wstart] = data
+        handle.ra_windows.move_to_end(wstart)
         while len(handle.ra_windows) > self._window_cache_cap():
-            handle.ra_windows.popitem(last=False)
+            evicted, _ = handle.ra_windows.popitem(last=False)
+            handle.ra_partial.discard(evicted)
         return data
 
     def _drop_readahead(self, handle, wait=False):
         handle.ra_windows = OrderedDict()
+        handle.ra_partial = set()
         futures = handle.ra_futures
         handle.ra_futures = {}
         for fut in futures.values():
@@ -631,7 +730,8 @@ class FsCore:
         end = offset + length
         while pos < end:
             wstart = (pos // wsize) * wsize
-            buf = self._get_window(handle, wstart)
+            buf = self._get_window(handle, wstart,
+                                   need=min(end - wstart, wsize))
             rel = pos - wstart
             if rel >= len(buf):
                 break  # EOF or short read from server
@@ -649,10 +749,27 @@ class FsCore:
     def read(self, handle, offset, length):
         """Read with async read-ahead. Raises FsError(END_OF_FILE) when
         offset is at/past EOF (adapters decide their platform semantics)."""
-        if handle.smb_open is None:
+        if handle.is_directory:
             raise FsError(ErrorCode.END_OF_FILE)
         try:
             with handle.io_lock:
+                if (handle.smb_open is None
+                        and offset + length <= HEAD_FETCH_SIZE):
+                    # Lazy handle + header sniff: open the file and read
+                    # its head in a single compound round trip, and prime
+                    # window 0 with the result.
+                    smb_open, head = self._smb.open_and_read(
+                        handle.smb_path, HEAD_FETCH_SIZE,
+                        write=handle.want_write)
+                    handle.smb_open = smb_open
+                    handle.file_size = smb_open.end_of_file
+                    handle.allocation_size = smb_open.allocation_size
+                    handle.ra_windows[0] = head
+                    if len(head) < min(self._window_size(),
+                                       handle.file_size):
+                        handle.ra_partial.add(0)
+                else:
+                    self._ensure_open(handle)
                 if offset >= handle.file_size:
                     raise FsError(ErrorCode.END_OF_FILE)
                 length = min(length, handle.file_size - offset)
@@ -676,10 +793,11 @@ class FsCore:
               constrained=False):
         """Buffered write feeding the pipelined writer with backpressure.
         Returns bytes accepted."""
-        if handle.smb_open is None:
+        if handle.is_directory:
             raise FsError(ErrorCode.INVALID_HANDLE)
         try:
             with handle.io_lock:
+                self._ensure_open(handle)
                 data = bytes(buffer)
                 if write_to_end:
                     offset = handle.file_size
@@ -749,6 +867,7 @@ class FsCore:
         """Truncate to zero on open-for-overwrite (Windows semantics)."""
         try:
             with handle.io_lock:
+                self._ensure_open(handle)
                 self._discard_writes(handle)
                 self._drop_readahead(handle)
                 self._smb.set_end_of_file(handle.smb_open, 0)
@@ -770,6 +889,10 @@ class FsCore:
     def truncate(self, handle, new_size, allocation_only=False):
         try:
             with handle.io_lock:
+                if not allocation_only:
+                    # Allocation-only changes never touch the server; a
+                    # real EOF move needs the deferred open materialized.
+                    self._ensure_open(handle)
                 # Buffered writes must land before we move EOF, otherwise a
                 # later flush would re-extend the file.
                 self._drain_writes(handle)

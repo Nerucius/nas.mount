@@ -62,6 +62,23 @@ Linux autotuning stays active).
 - **Fixed security descriptor** — "full access everyone" avoids translating SMB ACLs
 - **1:1 mapping** — each WinFsp `open()` creates one SMB Open handle, stored in `SmbFileContext`
 - **Path subpath support** — `M = "storage/media"` → share is `storage`, FUSE root is `media/` subdirectory
+- **Metadata in one round trip or none** — browsing is metadata-bound at 41 ms
+  RTT, so every metadata operation is either compounded or cached:
+  - `stat_path` = CREATE+CLOSE related compound (1 RTT, the create response
+    carries all metadata); `list_directory` = CREATE+QUERY(1 MB)+CLOSE compound
+    (1 RTT for dirs provably complete in one page, paged loop above ~1600
+    entries — which also fixed a silent-truncation bug for huge dirs).
+  - A fresh cached listing is authoritative for **negatives** too: Explorer's
+    desktop.ini/Thumbs.db probes on every folder visit cost zero round trips.
+  - Stat results (positive and negative) get their own TTL cache — Explorer
+    re-walks the ancestor chain of every path it touches.
+- **Lazy open + compound sniff** — a cache-hit open() defers the SMB CREATE
+  until the first data operation (most Explorer opens only read attributes we
+  already have). When the first read is small (≤ 256 KB), CREATE+READ go out
+  as one compound: open-and-sniff = 1 RTT. First-touch small reads fetch a
+  256 KB head instead of a full 4 MB window (upgraded in place if reading
+  continues), so a folder of images doesn't pull megabytes per thumbnail probe.
+  Clean read-only handles close in the background (no close RTT on the caller).
 - **Cheap cold opens** — open() consults the dir cache only; on a miss it opens
   the SMB handle directly (the create response carries all metadata) instead of
   listing the whole parent directory first.
@@ -183,7 +200,14 @@ Simple dict-based TTL cache:
 - Key: normalized SMB directory path
 - Value: `(timestamp, entries)` using `time.monotonic()`
 - Serves `get_security_by_name` and `read_directory` to avoid extra roundtrips
+- A fresh listing answers negative lookups too (name absent → NOT_FOUND, 0 RTT)
 - Invalidated on create/delete/rename (in `close()` for deletes, after the handle is actually closed)
+
+Plus a stat cache (`_stat_cache`): positive and negative single-path stat
+results with the same TTL, invalidated together with the parent listing
+(prefix scan covers renamed/deleted subtrees). Accepted staleness: files
+created/removed remotely appear/disappear within `dir_cache_ttl`, same
+contract as the listing cache.
 
 ## Entry Point (nas_mount.py)
 
