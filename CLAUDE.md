@@ -6,11 +6,11 @@ A Python FUSE filesystem using WinFsp (via winfspy) and smbprotocol to mount rem
 
 ## Tech stack
 
-- **Windows 10** - The running OS
-- **Python 3+** - TODO: setup a python env with the best version available for this
-- **winfspy** - Python bindings for WinFsp (FUSE on Windows). WinFsp is already installed (used by rclone)
-- **smbprotocol** - pure Python SMB2/3 client. Proven at 10.7 MB/s with 4 MB reads
-- **toml** - config file format (stdlib tomllib for reading, tomli-w if writing needed)
+- **Windows 10** - The running OS.
+- **Python 3.11** - `.venv` contains a python 3.11.9 env with the packages installed. 
+- **winfspy** - Python bindings for WinFsp (FUSE on Windows). WinFsp is already installed (used by rclone).
+- **smbprotocol** - pure Python SMB2/3 client. Proven at 10.7 MB/s with 4 MB reads.
+- **toml** - config file format (stdlib tomllib for reading, tomli-w if writing needed).
 
 ## Key constraints
 
@@ -86,3 +86,7 @@ smb2 max trans = 8388608
 - **Port 445**: Windows kernel reserves port 445. The remote server is on port 3445 (socat proxy on gateway forwards to TrueNAS:445).
 - **winfspy install**: may need Visual C++ build tools if no wheel is available. Check `pip install winfspy` first.
 - **Process lifetime**: the FUSE mount runs as long as the process lives. For auto-start, use a scheduled task or Windows service wrapper.
+
+## Coding agents
+
+Plans go in `.claude/plans`, no exceptions.
