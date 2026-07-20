@@ -92,6 +92,22 @@ Writes (ceiling: iperf3 measured 511-581 Mbps end-to-end):
 Depth sweeps showed write_size=4MB/depth=4-6 is the sweet spot; deeper/larger doesn't help.
 SMB signing cannot be disabled client-side (Samba rejects unsigned TreeConnect).
 
+Mounted macOS filesystem (FUSE-T, 2026-07-21, dd 192 MB through ~/nas/media):
+
+| Direction | nas-mount | native macOS SMB | raw engine |
+|-----------|-----------|------------------|------------|
+| Read | **12.7 MB/s (101 Mbps)** | 11.1 | 12.5 |
+| Write | **54.1 MB/s (433 Mbps)** | 42.0 | 57.2 |
+
+Key macOS/FUSE-T lessons (why fs_core is shaped the way it is):
+- FUSE-T = NFSv4 loopback; kernel interleaves its own readahead so reads
+  arrive out of order -> LRU window cache, never purge on seek.
+- NFS writeback delivers 32 KB writes out of order -> overlap-merging
+  segment coalescer; and COMMITs every few MB -> flush(sync_disk=False).
+- rwsize=1048576 mount option (default 32 KB callbacks).
+- macOS NFS has no xattr path; falls back to AppleDouble ._* files which
+  Samba fruit vetoes -> in-memory junk-file sink (also .DS_Store).
+
 Server-side Samba tuning (applied on TrueNAS via midclt, persisted):
 ```
 smb2 max read = 8388608
