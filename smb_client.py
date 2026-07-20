@@ -505,7 +505,8 @@ class SMBClient:
         else:
             file_open.create(
                 ImpersonationLevel.Impersonation,
-                FilePipePrinterAccessMask.FILE_WRITE_DATA
+                FilePipePrinterAccessMask.FILE_READ_DATA
+                | FilePipePrinterAccessMask.FILE_WRITE_DATA
                 | FilePipePrinterAccessMask.FILE_READ_ATTRIBUTES
                 | FilePipePrinterAccessMask.FILE_WRITE_ATTRIBUTES
                 | FilePipePrinterAccessMask.DELETE,

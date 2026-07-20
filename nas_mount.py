@@ -271,6 +271,9 @@ def parse_mount_config(config):
 
 
 def run_mount(config, debug=False):
+    if sys.platform == "darwin":
+        run_mount_macos(config, debug=debug)
+        return
     from winfspy import FileSystem
     from fuse_fs import SmbFileSystemOperations
 
@@ -351,6 +354,96 @@ def run_mount(config, debug=False):
                 print("OK")
             except Exception as e:
                 print(f"FAILED ({e})")
+        for client in clients_by_share.values():
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+        print("  Done.")
+
+
+def run_mount_macos(config, debug=False):
+    import subprocess
+    from macos_fs import SmbMacOperations, mount_macos
+
+    tuning = config.get("tuning", {})
+    macos_cfg = config.get("macos", {})
+    mount_root = os.path.expanduser(macos_cfg.get("mount_root", "~/nas"))
+    overrides = macos_cfg.get("mounts", {})
+    mount_configs = parse_mount_config(config)
+
+    clients_by_share = {}
+    mounted = []  # (mountpoint, thread)
+
+    print("=" * 60)
+    print("  nas-mount (macOS)")
+    print("=" * 60)
+
+    try:
+        for mc in mount_configs:
+            drive = mc["drive"]
+            share_name = mc["share_name"]
+            subpath = mc["subpath"]
+
+            if share_name not in clients_by_share:
+                client = build_client(config, share_name=share_name)
+                print(f"\n  Connecting to share '{share_name}'...", end=" ", flush=True)
+                client.connect()
+                print("OK")
+                clients_by_share[share_name] = client
+            else:
+                client = clients_by_share[share_name]
+
+            ops = SmbMacOperations(
+                smb_client=client,
+                subpath=subpath,
+                dir_cache_ttl=tuning.get("dir_cache_ttl", 300),
+                readahead_windows=tuning.get("readahead_windows", 2),
+                readahead_workers=tuning.get("readahead_workers", 8),
+                volume_label=mc["label"],
+            )
+
+            basename = (subpath.split("/")[-1] if subpath else share_name).lower()
+            mountpoint = os.path.expanduser(
+                overrides.get(drive, os.path.join(mount_root, basename)))
+
+            label = f"{mountpoint} -> {share_name}/{subpath}" if subpath \
+                else f"{mountpoint} -> {share_name}"
+            print(f"  Mounting {label}...", flush=True)
+            t = threading.Thread(
+                target=mount_macos,
+                args=(ops, mountpoint, mc["label"]),
+                kwargs={"debug": debug},
+                name=f"fuse-{drive}",
+                daemon=True,
+            )
+            t.start()
+            mounted.append((mountpoint, t))
+
+        print(f"\n  {len(mounted)} mount(s) active. Press Ctrl+C to stop.")
+        print("=" * 60)
+
+        # FUSE threads block until their volume is unmounted. Converge on
+        # shutdown whether we get KeyboardInterrupt here or libfuse's own
+        # signal handler unmounts one of the volumes.
+        try:
+            while all(t.is_alive() for _, t in mounted):
+                time.sleep(1)
+            print("\n  A mount exited; shutting down the rest...")
+        except KeyboardInterrupt:
+            print("\n\n  Shutting down...")
+
+    finally:
+        for mountpoint, t in mounted:
+            if t.is_alive():
+                print(f"  Unmounting {mountpoint}...", end=" ", flush=True)
+                r = subprocess.run(["umount", mountpoint],
+                                   capture_output=True, text=True)
+                if r.returncode != 0:
+                    subprocess.run(["diskutil", "unmount", "force", mountpoint],
+                                   capture_output=True, text=True)
+                t.join(timeout=10)
+                print("OK" if not t.is_alive() else "STUCK")
         for client in clients_by_share.values():
             try:
                 client.disconnect()

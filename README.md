@@ -35,15 +35,19 @@ end-to-end TCP ceiling on this path is ~580 Mbps.
 
 ## Requirements
 
-- Windows 10/11
-- [WinFsp](https://winfsp.dev/) (FUSE for Windows)
-- Python 3.10+
+- Windows 10/11 with [WinFsp](https://winfsp.dev/), **or** macOS with
+  [FUSE-T](https://www.fuse-t.org/) (`brew install fuse-t` — kextless, no
+  security-policy changes needed on Apple Silicon)
+- Python 3.11+
 
 ## Installation
 
 ```
-pip install -r requirements.txt
+pip install -r requirements.txt   # picks winfspy or fusepy per platform
 ```
+
+On macOS, mounts land under `~/nas/<name>` by default (configurable via the
+`[macos]` section in config.toml).
 
 ## Usage
 

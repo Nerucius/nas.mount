@@ -6,10 +6,11 @@ A Python FUSE filesystem using WinFsp (via winfspy) and smbprotocol to mount rem
 
 ## Tech stack
 
-- **Windows 10** - The running OS.
-- **Python 3.11** - `.venv` contains a python 3.11.9 env with the packages installed. 
-- **winfspy** (v0.8.4) - Python bindings for WinFsp (FUSE on Windows). WinFsp is already installed (used by rclone).
-- **smbprotocol** (v1.17.0) - pure Python SMB2/3 client with pipelined write support via `send=False`.
+- **Windows 10** (primary) and **macOS** (Apple Silicon) - both mount the same shares.
+- **Python 3.11** - `.venv` contains the env with packages installed.
+- **winfspy** (v0.8.4, Windows only) - Python bindings for WinFsp. WinFsp is already installed (used by rclone).
+- **fusepy + FUSE-T** (macOS only) - kextless FUSE; `brew install fuse-t`. macos_fs.py auto-detects the libfuse-t dylib.
+- **smbprotocol** (v1.17.0) - pure Python SMB2/3 client, pipelined via `send=False`; internally thread-safe.
 - **toml** - config file format (stdlib tomllib for reading).
 
 ## Key constraints
@@ -40,9 +41,12 @@ nas.mount/
 ├── config.example.toml     # Template config (no secrets)
 ├── config.toml             # Local config with credentials (gitignored)
 ├── requirements.txt
-├── nas_mount.py            # Entry point - arg parsing, mount orchestration
-├── smb_client.py           # SMB connection wrapper with reconnect + pipelined writes
-└── fuse_fs.py              # WinFsp filesystem implementation (read-ahead + write-behind)
+├── nas_mount.py            # Entry point - arg parsing, platform dispatch, benchmarks
+├── smb_client.py           # SMB connection wrapper: pipelined reads/writes, reconnect
+├── fs_core.py              # Platform-agnostic engine: read-ahead, write pipeline, caches
+├── fuse_fs.py              # Windows adapter (winfspy/WinFsp) over fs_core
+├── macos_fs.py             # macOS adapter (fusepy/FUSE-T) over fs_core
+└── mount.ps1               # Windows auto-mount scheduled-task helper
 ```
 
 ## Development commands

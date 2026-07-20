@@ -28,9 +28,11 @@ Linux autotuning stays active).
 
 | File | Role | Key Class |
 |------|------|-----------|
-| smb_client.py | SMB connection wrapper — connect, read, write (pipelined), list, stat, rename, delete, reconnect. One lock serializes all ops (smbprotocol isn't thread-safe) | `SMBClient` |
-| fuse_fs.py | WinFsp callbacks — translates FUSE ops to SMB calls, manages dir cache, read-ahead buffer, and write-behind buffer | `SmbFileSystemOperations(BaseFileSystemOperations)` |
-| nas_mount.py | Entry point — config loading (tomllib), arg parsing, creates one SMBClient + FileSystem per mount letter, signal handling | orchestration |
+| smb_client.py | SMB connection wrapper — connect, pipelined reads (`read_file_pipelined`), sliding-window writes (`PipelinedWriter`), list, stat, rename, delete, single-flight reconnect. Concurrent ops (smbprotocol is internally thread-safe) | `SMBClient` |
+| fs_core.py | Platform-agnostic engine — async read-ahead windows, write coalescing + backpressure, dir cache, path mapping, `FsError` taxonomy. Paths backslash-separated, timestamps FILETIME, attrs Windows bits | `FsCore`, `FileHandle` |
+| fuse_fs.py | Windows adapter — WinFsp callbacks over FsCore: NTSTATUS mapping, security descriptors, delete-on-close semantics, readdir markers | `SmbFileSystemOperations(BaseFileSystemOperations)` |
+| macos_fs.py | macOS adapter — fusepy (FUSE-T) callbacks over FsCore: errno mapping, epoch timestamps, POSIX unlink/rename, xattr fast-fail, handle table | `SmbMacOperations(Operations)` |
+| nas_mount.py | Entry point — config loading (tomllib), arg parsing, platform dispatch (win32 → winfspy, darwin → fusepy threads), benchmarks | orchestration |
 
 ## Key Design Decisions
 

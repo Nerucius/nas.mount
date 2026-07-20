@@ -24,3 +24,9 @@ Z = "storage/backups"
 M = "TrueNAS Media"
 Y = "TrueNAS Documents"
 Z = "TrueNAS Backups"
+
+[macos]
+mount_root = "~/nas"     # each mount lands at <mount_root>/<subpath basename>
+# Optional explicit mountpoint overrides per drive key:
+# [macos.mounts]
+# M = "/Volumes/nas-media"
