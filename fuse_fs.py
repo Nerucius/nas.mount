@@ -8,7 +8,7 @@ from winfspy import (
     FILE_ATTRIBUTE,
     NTStatusObjectNameNotFound,
     NTStatusEndOfFile,
-    NTStatusMediaWriteProtected,
+    NTStatusDirectoryNotEmpty,
     NTStatusError,
 )
 from winfspy.plumbing.security_descriptor import SecurityDescriptor
@@ -51,7 +51,8 @@ class SmbFileContext:
     __slots__ = ("path", "smb_path", "smb_open", "is_directory",
                  "file_attributes", "file_size", "allocation_size",
                  "creation_time", "last_access_time", "last_write_time",
-                 "change_time", "_buf", "_buf_start", "_buf_end")
+                 "change_time", "_buf", "_buf_start", "_buf_end",
+                 "_wbuf", "_wbuf_offset", "_delete_pending")
 
     def __init__(self, path, smb_path, smb_open=None, is_directory=False,
                  file_attributes=0, file_size=0, allocation_size=0,
@@ -71,6 +72,9 @@ class SmbFileContext:
         self._buf = None
         self._buf_start = 0
         self._buf_end = 0
+        self._wbuf = bytearray()
+        self._wbuf_offset = 0
+        self._delete_pending = False
 
     def get_file_info(self):
         return {
@@ -94,6 +98,17 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
         self._dir_cache_ttl = dir_cache_ttl
         self._dir_cache = {}
         self._cache_lock = threading.Lock()
+
+    def _flush_write_buf(self, file_context):
+        buf = file_context._wbuf
+        if not buf:
+            return
+        data = bytes(buf)
+        size = len(data)
+        offset = file_context._wbuf_offset
+        file_context._wbuf = bytearray()
+        log.debug("flush_write %s offset=%d len=%d", file_context.path, offset, size)
+        self._smb.write_file(file_context.smb_open, data, offset)
 
     def _to_smb_path(self, winfsp_path):
         relative = winfsp_path.lstrip("\\")
@@ -184,14 +199,25 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
             status = exc.status
             if status == 0xC0000034 or status == 0xC000003A:
                 raise NTStatusObjectNameNotFound()
+            if status == 0xC0000103:
+                raise NTStatusObjectNameNotFound()
             if status == 0xC0000022:
-                from winfspy import NTStatusAccessDenied
-                raise NTStatusAccessDenied()
-            log.error("SMB error: %s (0x%08x)", exc.message, status)
-            raise NTStatusError(NTSTATUS.STATUS_UNEXPECTED_IO_ERROR)
+                raise NTStatusError(NTSTATUS.STATUS_ACCESS_DENIED)
+            if status == 0xC0000035:
+                raise NTStatusError(NTSTATUS.STATUS_OBJECT_NAME_COLLISION)
+            if status == 0xC0000043:
+                raise NTStatusError(NTSTATUS.STATUS_SHARING_VIOLATION)
+            if status == 0xC0000101:
+                raise NTStatusDirectoryNotEmpty()
+            log.error("Unmapped SMB error: %s (0x%08x)", exc.message, status)
+            try:
+                raise NTStatusError(NTSTATUS(status))
+            except ValueError:
+                raise NTStatusError(NTSTATUS.STATUS_UNEXPECTED_IO_ERROR)
         if isinstance(exc, SMBConnectionClosed):
             log.error("SMB connection lost: %s", exc)
             raise NTStatusError(NTSTATUS.STATUS_UNEXPECTED_IO_ERROR)
+        log.error("Unexpected error: %s", exc)
         raise NTStatusError(NTSTATUS.STATUS_UNEXPECTED_IO_ERROR)
 
     # -- WinFsp callbacks --
@@ -224,7 +250,7 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
         except NTStatusError:
             raise
         except Exception as e:
-            log.error("get_security_by_name(%s) failed: %s", file_name, e)
+            log.debug("get_security_by_name(%s): %s", file_name, e)
             self._handle_smb_error(e)
 
     def open(self, file_name, create_options, granted_access):
@@ -250,8 +276,9 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
 
         smb_open = None
         if not is_dir:
+            want_write = bool(granted_access & 0x12B0116)
             try:
-                smb_open = self._smb.open_file(smb_path, read=True)
+                smb_open = self._smb.open_file(smb_path, read=True, write=want_write)
             except Exception as e:
                 log.error("open(%s) SMB open failed: %s", file_name, e)
                 self._handle_smb_error(e)
@@ -290,8 +317,19 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
     def close(self, file_context):
         file_context._buf = None
         if file_context.smb_open is not None:
+            if not file_context._delete_pending:
+                try:
+                    self._flush_write_buf(file_context)
+                except Exception as e:
+                    log.debug("flush on close(%s) failed: %s", file_context.path, e)
             self._smb.close_file(file_context.smb_open)
             file_context.smb_open = None
+        if file_context._delete_pending:
+            smb_path = file_context.smb_path
+            if file_context.is_directory:
+                self._invalidate_cache(smb_path)
+            parent = smb_path.rsplit("\\", 1)[0] if "\\" in smb_path else ""
+            self._invalidate_cache(parent)
 
     def get_file_info(self, file_context):
         return file_context.get_file_info()
@@ -376,35 +414,171 @@ class SmbFileSystemOperations(BaseFileSystemOperations):
 
         return entries
 
+    def create(self, file_name, create_options, granted_access, file_attributes,
+               security_descriptor, allocation_size):
+        smb_path = self._to_smb_path(file_name)
+        is_dir = bool(create_options & 0x1)
+        try:
+            smb_open = self._smb.create_file(smb_path, is_directory=is_dir)
+        except Exception as e:
+            log.error("create(%s) failed: %s", file_name, e)
+            self._handle_smb_error(e)
+
+        now = filetime_now()
+        if is_dir:
+            self._smb.close_file(smb_open)
+            ctx = SmbFileContext(
+                path=file_name, smb_path=smb_path, smb_open=None,
+                is_directory=True,
+                file_attributes=FILE_ATTRIBUTE.FILE_ATTRIBUTE_DIRECTORY,
+                creation_time=now, last_access_time=now,
+                last_write_time=now, change_time=now,
+            )
+        else:
+            ctx = SmbFileContext(
+                path=file_name, smb_path=smb_path, smb_open=smb_open,
+                is_directory=False,
+                file_attributes=file_attributes or FILE_ATTRIBUTE.FILE_ATTRIBUTE_NORMAL,
+                creation_time=now, last_access_time=now,
+                last_write_time=now, change_time=now,
+            )
+
+        parent_smb = self._to_smb_path(self._parent_path(file_name))
+        self._invalidate_cache(parent_smb)
+        return ctx
+
+    def write(self, file_context, buffer, offset, write_to_end_of_file,
+              constrained_io):
+        if file_context.smb_open is None:
+            raise NTStatusError(NTSTATUS.STATUS_INVALID_HANDLE)
+        try:
+            if write_to_end_of_file:
+                offset = file_context.file_size
+            data = bytes(buffer)
+            length = len(data)
+            wbuf = file_context._wbuf
+            flush_size = self._smb.write_size
+
+            if wbuf and offset == file_context._wbuf_offset + len(wbuf):
+                wbuf.extend(data)
+            else:
+                if wbuf:
+                    self._flush_write_buf(file_context)
+                file_context._wbuf = bytearray(data)
+                file_context._wbuf_offset = offset
+
+            if len(file_context._wbuf) >= flush_size:
+                self._flush_write_buf(file_context)
+
+            new_end = offset + length
+            if new_end > file_context.file_size:
+                file_context.file_size = new_end
+                file_context.allocation_size = new_end
+            file_context.last_write_time = filetime_now()
+            file_context.change_time = file_context.last_write_time
+            file_context._buf = None
+            return length
+        except Exception as e:
+            log.error("write(%s, offset=%d, len=%d) failed: %s",
+                      file_context.path, offset, len(buffer), e)
+            self._handle_smb_error(e)
+
+    def overwrite(self, file_context, file_attributes, replace_file_attributes,
+                  allocation_size):
+        try:
+            self._smb.set_end_of_file(file_context.smb_open, 0)
+            file_context.file_size = 0
+            file_context.allocation_size = 0
+            if replace_file_attributes:
+                file_context.file_attributes = (
+                    file_attributes or FILE_ATTRIBUTE.FILE_ATTRIBUTE_NORMAL)
+            file_context.last_write_time = filetime_now()
+            file_context.change_time = file_context.last_write_time
+            file_context._buf = None
+        except Exception as e:
+            log.error("overwrite(%s) failed: %s", file_context.path, e)
+            self._handle_smb_error(e)
+
     def cleanup(self, file_context, file_name, flags):
-        pass
+        if flags & 0x01:
+            file_context._delete_pending = True
+            try:
+                if file_context.smb_open is not None:
+                    self._smb.set_delete_on_close(file_context.smb_open)
+                else:
+                    smb_path = self._to_smb_path(file_name)
+                    if file_context.is_directory:
+                        self._smb.delete_directory(smb_path)
+                    else:
+                        self._smb.delete_file(smb_path)
+            except Exception as e:
+                log.error("cleanup delete(%s) failed: %s", file_name, e)
 
     def flush(self, file_context):
-        pass
+        if file_context.smb_open is not None:
+            try:
+                self._flush_write_buf(file_context)
+                self._smb.flush_file(file_context.smb_open)
+            except Exception as e:
+                log.debug("flush(%s) failed: %s", file_context.path, e)
 
     def get_security(self, file_context):
         return SECURITY_DESCRIPTOR
 
     def set_security(self, file_context, security_information, modification_descriptor):
-        raise NTStatusMediaWriteProtected()
+        pass
 
     def set_basic_info(self, file_context, file_attributes, creation_time,
                        last_access_time, last_write_time, change_time, file_info):
+        if file_attributes != 0 and file_attributes != 0xFFFFFFFF:
+            file_context.file_attributes = file_attributes
+        if creation_time:
+            file_context.creation_time = creation_time
+        if last_access_time:
+            file_context.last_access_time = last_access_time
+        if last_write_time:
+            file_context.last_write_time = last_write_time
+        if change_time:
+            file_context.change_time = change_time
         return file_context.get_file_info()
 
     def set_file_size(self, file_context, new_size, set_allocation_size):
-        raise NTStatusMediaWriteProtected()
+        try:
+            if not set_allocation_size:
+                self._smb.set_end_of_file(file_context.smb_open, new_size)
+                file_context.file_size = new_size
+            file_context.allocation_size = new_size
+            file_context._buf = None
+        except Exception as e:
+            log.error("set_file_size(%s, %d) failed: %s",
+                      file_context.path, new_size, e)
+            self._handle_smb_error(e)
 
     def can_delete(self, file_context, file_name):
-        raise NTStatusMediaWriteProtected()
+        if file_context.is_directory:
+            smb_path = self._to_smb_path(file_name)
+            try:
+                entries = self._smb.list_directory(smb_path)
+                real = [e for e in entries if e["file_name"] not in (".", "..")]
+                if real:
+                    raise NTStatusDirectoryNotEmpty()
+            except NTStatusError:
+                raise
+            except Exception as e:
+                self._handle_smb_error(e)
 
     def rename(self, file_context, file_name, new_file_name, replace_if_exists):
-        raise NTStatusMediaWriteProtected()
-
-    def overwrite(self, file_context, file_attributes, replace_file_attributes,
-                  allocation_size):
-        raise NTStatusMediaWriteProtected()
-
-    def create(self, file_name, create_options, granted_access, file_attributes,
-               security_descriptor, allocation_size):
-        raise NTStatusMediaWriteProtected()
+        old_smb = self._to_smb_path(file_name)
+        new_smb = self._to_smb_path(new_file_name)
+        try:
+            self._smb.rename(old_smb, new_smb, replace_if_exists=replace_if_exists)
+            file_context.path = new_file_name
+            file_context.smb_path = new_smb
+            old_parent = self._to_smb_path(self._parent_path(file_name))
+            new_parent = self._to_smb_path(self._parent_path(new_file_name))
+            self._invalidate_cache(old_parent)
+            if new_parent != old_parent:
+                self._invalidate_cache(new_parent)
+        except Exception as e:
+            log.error("rename(%s -> %s) failed: %s", file_name, new_file_name, e)
+            self._handle_smb_error(e)

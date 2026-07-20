@@ -5,8 +5,8 @@ user = "herman"
 password = ""  # or set NAS_MOUNT_PASSWORD env var
 
 [tuning]
-read_size = 4194304      # 4 MB - optimal for ~37ms RTT
-write_size = 4194304     # 4 MB
+read_size = 4194304      # 4 MB - read-ahead buffer, good for streaming
+write_size = 4194304     # 4 MB - sweet spot (8 MB is slower due to per-request latency)
 dir_cache_ttl = 300      # directory listing cache in seconds
 attr_cache_ttl = 60      # file attribute cache in seconds
 reconnect_delay = 5      # seconds before reconnect attempt

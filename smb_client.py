@@ -16,7 +16,14 @@ from smbprotocol.open import (
     CreateOptions,
     ShareAccess,
 )
-from smbprotocol.file_info import FileAttributes, FileInformationClass
+from smbprotocol.file_info import (
+    FileAttributes,
+    FileInformationClass,
+    FileDispositionInformation,
+    FileEndOfFileInformation,
+    FileRenameInformation,
+)
+from smbprotocol.open import SMB2SetInfoRequest, SMB2SetInfoResponse
 from smbprotocol.exceptions import (
     SMBConnectionClosed,
     SMBException,
@@ -83,7 +90,13 @@ class SMBClient:
         unc = f"\\\\{self.host}\\{self.share_name}"
         self._tree = TreeConnect(self._session, unc)
         self._tree.connect(require_secure_negotiate=False)
-        log.info("Connected to %s", unc)
+
+        credits_needed = max(self.read_size, self.write_size) // 65536 + 16
+        granted = self._connection.echo(
+            sid=self._session.session_id, credit_request=credits_needed)
+        sw = self._connection.sequence_window
+        log.info("Connected to %s (credits: %d available)",
+                 unc, sw["high"] - sw["low"])
 
     def disconnect(self):
         with self._lock:
@@ -221,7 +234,7 @@ class SMBClient:
 
     def _open_file(self, path, read, write):
         file_open = Open(self._tree, path)
-        access = 0
+        access = FilePipePrinterAccessMask.DELETE
         if read:
             access |= (FilePipePrinterAccessMask.FILE_READ_DATA
                        | FilePipePrinterAccessMask.FILE_READ_ATTRIBUTES)
@@ -233,7 +246,8 @@ class SMBClient:
             ImpersonationLevel.Impersonation,
             access,
             FileAttributes.FILE_ATTRIBUTE_NORMAL,
-            ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE,
+            ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE
+            | ShareAccess.FILE_SHARE_DELETE,
             CreateDisposition.FILE_OPEN,
             CreateOptions.FILE_NON_DIRECTORY_FILE,
         )
@@ -245,9 +259,40 @@ class SMBClient:
                 lambda: file_open.read(offset, length))
 
     def write_file(self, file_open, data, offset=0):
+        if not isinstance(data, bytes):
+            data = bytes(data)
         with self._lock:
             return self._with_reconnect(
-                lambda: file_open.write(data, offset))
+                lambda: self._write_file(file_open, data, offset))
+
+    def _write_file(self, file_open, data, offset):
+        max_size = self._connection.max_write_size
+        total = 0
+        while total < len(data):
+            chunk = data[total:total + max_size]
+            written = file_open.write(chunk, offset + total)
+            total += written
+        return total
+
+    def set_delete_on_close(self, file_open):
+        with self._lock:
+            return self._with_reconnect(
+                lambda: self._set_delete_on_close(file_open))
+
+    def _set_delete_on_close(self, file_open):
+        info = FileDispositionInformation()
+        info["delete_pending"] = True
+        req = SMB2SetInfoRequest()
+        req["info_type"] = info.INFO_TYPE
+        req["file_info_class"] = info.INFO_CLASS
+        req["file_id"] = file_open.file_id
+        req["buffer"] = info
+        request = file_open.connection.send(
+            req, file_open.tree_connect.session.session_id,
+            file_open.tree_connect.tree_connect_id)
+        response = file_open.connection.receive(request)
+        resp = SMB2SetInfoResponse()
+        resp.unpack(response["data"].get_value())
 
     def close_file(self, file_open):
         with self._lock:
@@ -276,7 +321,7 @@ class SMBClient:
                 | DirectoryAccessMask.FILE_READ_ATTRIBUTES,
                 FileAttributes.FILE_ATTRIBUTE_DIRECTORY,
                 ShareAccess.FILE_SHARE_READ,
-                CreateDisposition.FILE_CREATE,
+                CreateDisposition.FILE_OPEN_IF,
                 CreateOptions.FILE_DIRECTORY_FILE,
             )
         else:
@@ -284,9 +329,11 @@ class SMBClient:
                 ImpersonationLevel.Impersonation,
                 FilePipePrinterAccessMask.FILE_WRITE_DATA
                 | FilePipePrinterAccessMask.FILE_READ_ATTRIBUTES
-                | FilePipePrinterAccessMask.FILE_WRITE_ATTRIBUTES,
+                | FilePipePrinterAccessMask.FILE_WRITE_ATTRIBUTES
+                | FilePipePrinterAccessMask.DELETE,
                 FileAttributes.FILE_ATTRIBUTE_NORMAL,
-                ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE,
+                ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE
+                | ShareAccess.FILE_SHARE_DELETE,
                 CreateDisposition.FILE_CREATE,
                 CreateOptions.FILE_NON_DIRECTORY_FILE,
             )
@@ -307,3 +354,77 @@ class SMBClient:
             CreateOptions.FILE_DELETE_ON_CLOSE | CreateOptions.FILE_NON_DIRECTORY_FILE,
         )
         file_open.close()
+
+    def delete_directory(self, path):
+        with self._lock:
+            return self._with_reconnect(lambda: self._delete_directory(path))
+
+    def _delete_directory(self, path):
+        dir_open = Open(self._tree, path)
+        dir_open.create(
+            ImpersonationLevel.Impersonation,
+            DirectoryAccessMask.DELETE,
+            FileAttributes.FILE_ATTRIBUTE_DIRECTORY,
+            ShareAccess.FILE_SHARE_DELETE | ShareAccess.FILE_SHARE_READ,
+            CreateDisposition.FILE_OPEN,
+            CreateOptions.FILE_DELETE_ON_CLOSE | CreateOptions.FILE_DIRECTORY_FILE,
+        )
+        dir_open.close()
+
+    def set_end_of_file(self, file_open, size):
+        with self._lock:
+            return self._with_reconnect(
+                lambda: self._set_end_of_file(file_open, size))
+
+    def _set_end_of_file(self, file_open, size):
+        info = FileEndOfFileInformation()
+        info["end_of_file"] = size
+        req = SMB2SetInfoRequest()
+        req["info_type"] = info.INFO_TYPE
+        req["file_info_class"] = info.INFO_CLASS
+        req["file_id"] = file_open.file_id
+        req["buffer"] = info
+        request = file_open.connection.send(
+            req, file_open.tree_connect.session.session_id,
+            file_open.tree_connect.tree_connect_id)
+        response = file_open.connection.receive(request)
+        resp = SMB2SetInfoResponse()
+        resp.unpack(response["data"].get_value())
+
+    def rename(self, old_path, new_path, replace_if_exists=False):
+        with self._lock:
+            return self._with_reconnect(
+                lambda: self._rename(old_path, new_path, replace_if_exists))
+
+    def _rename(self, old_path, new_path, replace_if_exists):
+        file_open = Open(self._tree, old_path)
+        try:
+            file_open.create(
+                ImpersonationLevel.Impersonation,
+                FilePipePrinterAccessMask.DELETE
+                | FilePipePrinterAccessMask.FILE_READ_ATTRIBUTES,
+                FileAttributes.FILE_ATTRIBUTE_NORMAL,
+                ShareAccess.FILE_SHARE_READ | ShareAccess.FILE_SHARE_WRITE
+                | ShareAccess.FILE_SHARE_DELETE,
+                CreateDisposition.FILE_OPEN,
+                0,
+            )
+            info = FileRenameInformation()
+            info["replace_if_exists"] = replace_if_exists
+            info["file_name"] = new_path
+            req = SMB2SetInfoRequest()
+            req["info_type"] = info.INFO_TYPE
+            req["file_info_class"] = info.INFO_CLASS
+            req["file_id"] = file_open.file_id
+            req["buffer"] = info
+            request = file_open.connection.send(
+                req, file_open.tree_connect.session.session_id,
+                file_open.tree_connect.tree_connect_id)
+            response = file_open.connection.receive(request)
+            resp = SMB2SetInfoResponse()
+            resp.unpack(response["data"].get_value())
+        finally:
+            try:
+                file_open.close()
+            except Exception:
+                pass
