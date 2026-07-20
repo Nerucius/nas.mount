@@ -1,0 +1,18 @@
+[connection]
+host = "example.org"
+port = 3445
+user = "herman"
+password = ""  # or set NAS_MOUNT_PASSWORD env var
+
+[tuning]
+read_size = 4194304      # 4 MB - optimal for ~37ms RTT
+write_size = 4194304     # 4 MB
+dir_cache_ttl = 300      # directory listing cache in seconds
+attr_cache_ttl = 60      # file attribute cache in seconds
+reconnect_delay = 5      # seconds before reconnect attempt
+max_reconnect_attempts = 10
+
+[mounts]
+M = "storage/media"
+Y = "storage/documents"
+Z = "storage/backups"
