@@ -1,0 +1,53 @@
+{
+    // Remount tasks: stop any running nas-mount instance (unmounting the
+    // volumes) and start a fresh one in a dedicated terminal panel.
+    // Terminal > Run Task... > pick the one for this machine's OS.
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "NAS: Remount all (macOS)",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            // SIGINT first: nas_mount unmounts cleanly and drains pending
+            // background deletes. The [n] trick stops pkill -f from
+            // matching this task's own shell command line.
+            "command": "pkill -INT -f '[n]as_mount.py' && for i in {1..15}; do pgrep -f '[n]as_mount.py' >/dev/null || break; sleep 1; done; pkill -9 -f '[n]as_mount.py' 2>/dev/null; ./.venv/bin/python nas_mount.py",
+            "isBackground": false,
+            "problemMatcher": [],
+            "presentation": {
+                "panel": "dedicated",
+                "reveal": "always",
+                "clear": true
+            }
+        },
+        {
+            "label": "NAS: Remount all (Windows)",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "powershell.exe",
+                    "args": [
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command"
+                    ]
+                }
+            },
+            // Same process cleanup as mount.ps1, but runs the mount in
+            // this terminal so the logs are visible. WinFsp drops the
+            // drive letters as soon as the old process dies.
+            "command": "Get-CimInstance Win32_Process -Filter \"Name LIKE 'python%'\" | Where-Object { $_.CommandLine -like '*nas_mount*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; Start-Sleep -Seconds 2; & .venv\\Scripts\\python.exe nas_mount.py",
+            "isBackground": false,
+            "problemMatcher": [],
+            "presentation": {
+                "panel": "dedicated",
+                "reveal": "always",
+                "clear": true
+            }
+        }
+    ]
+}

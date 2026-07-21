@@ -19,17 +19,17 @@ A Python FUSE filesystem using WinFsp (via winfspy) and smbprotocol to mount rem
 - **WinFsp callbacks run on arbitrary threads** - smbprotocol's Connection IS internally thread-safe (socket send lock, sequence/credit lock, receiver thread with per-request events), so SMB ops run concurrently. Only connect/reconnect is serialized via a state lock; per-file buffer state is guarded by a per-context lock.
 - **Directory listing can be slow** - cache READDIR results with configurable TTL (default 300s). Invalidated on create/delete/rename. Browsing is metadata-bound at 41ms RTT, so metadata ops are compounded (stat = CREATE+CLOSE, listing = CREATE+QUERY+CLOSE, each 1 RTT), fresh listings answer negative probes (desktop.ini/Thumbs.db) with 0 RTT, stat results have their own TTL cache, file opens are lazy (SMB CREATE deferred to first data op; small first read = compound CREATE+READ), and clean read-only closes happen in the background. Explorer folder paint went from ~4s to instant-warm/~0.3s-cold; per-file sniffs from ~170ms to ~76ms.
 - **Bulk namespace ops (delete/rename/copy)** - the Windows shell deletes folders file-by-file, serially. Deletes are 1-RTT compounds fired in the background (parent-scoped draining before rmdir/create/rename/relisting; dir deletes sync); renames are CREATE+SET_INFO+CLOSE compounds. Caches are edited surgically (insert/update/remove/move) instead of invalidating the parent per file, so bulk batches stay warm. 30-file folder delete: ~10ms/file (was ~125). `dir_info_timeout` (1s) is split from `file_info_timeout` (5s) so renames/deletes never look unapplied on refresh.
-- **File metadata (size, dates) must be accurate** - Windows Explorer and media players rely on correct file sizes for seek/progress. Cached in SmbFileContext on open.
+- **File metadata (size, dates) must be accurate** - Windows Explorer and media players rely on correct file sizes for seek/progress. Cached on the FileHandle at open; refreshed from the CREATE response when a lazy open materializes.
 - **SMB credits limit request sizes** - server grants credits incrementally. Client requests credits on connect via echo and with each pipelined write. 64 credits = 4 MB max per single request.
 - **Credential handling** - password stored in config.toml (same security posture as rclone.conf). Do not log passwords.
 
 ## Architecture decisions
 
 - One SMB `Connection` + `Session` + `TreeConnect` per unique share name. Multiple mounts to the same share reuse one connection.
-- File handles: WinFsp `open()`/`create()` returns `SmbFileContext` wrapping an smbprotocol `Open` object.
+- File handles: adapters' `open()`/`create()` return an `fs_core.FileHandle`; the smbprotocol `Open` inside is deferred on cache-hit opens (lazy open) until the first data operation.
 - Read strategy: pipelined reads (`read_pipeline_depth` in flight via `send=False`) + async read-ahead — a shared thread pool prefetches the next `readahead_windows` 4 MB windows while the consumer drains the current one. Small reads (mpv 64 KB seeks) served from memory; sequential streams never stall on the network.
 - Write strategy: WinFsp's ~1 MB writes coalesce into 4 MB chunks feeding a per-handle `PipelinedWriter` sliding window (`write_pipeline_depth` in flight). `submit()` applies backpressure when full; the connection never idles between chunks. Reads drain pending writes first (consistency).
-- Caching: directory entries cached in memory with TTL. File content is NOT cached (WinFsp's `file_info_timeout=1000` enables kernel caching).
+- Caching: directory listings + single-path stats (positive AND negative) cached in memory with TTL; our own mutations edit the caches surgically (insert/update/remove/move) instead of invalidating. File content is NOT cached in Python (WinFsp `file_info_timeout=5000` / `dir_info_timeout=1000` enable kernel caching).
 - Config: TOML file at `config.toml` in project root. Passwords can alternatively come from `NAS_MOUNT_PASSWORD` env var.
 
 ## File structure
@@ -43,11 +43,13 @@ nas.mount/
 ├── config.toml             # Local config with credentials (gitignored)
 ├── requirements.txt
 ├── nas_mount.py            # Entry point - arg parsing, platform dispatch, benchmarks
-├── smb_client.py           # SMB connection wrapper: pipelined reads/writes, reconnect
-├── fs_core.py              # Platform-agnostic engine: read-ahead, write pipeline, caches
+├── smb_client.py           # SMB connection wrapper: pipelined reads/writes, compound metadata ops, reconnect
+├── fs_core.py              # Platform-agnostic engine: read-ahead, write pipeline, caches, async deletes
 ├── fuse_fs.py              # Windows adapter (winfspy/WinFsp) over fs_core
 ├── macos_fs.py             # macOS adapter (fusepy/FUSE-T) over fs_core
-└── mount.ps1               # Windows auto-mount scheduled-task helper
+├── mount.ps1               # Windows auto-mount scheduled-task helper (register: see README)
+├── mount.sh                # macOS auto-mount launchd helper (install/uninstall/status)
+└── .vscode/tasks.json      # "NAS: Remount all" tasks for both platforms
 ```
 
 ## Development commands
@@ -133,7 +135,7 @@ FreeBSD sysctls persisted as TrueNAS tunables: `kern.ipc.maxsockbuf=16M`,
 - **Port 445**: Windows kernel reserves port 445. The remote server is on port 3445 (socat proxy on gateway forwards to TrueNAS:445).
 - **DO NOT replace socat with kernel DNAT**: tried and root-caused 2026-07-20. FreeBSD 13.1's base TCP stack (TrueNAS CORE, no RACK/pacing modules) collapses to ~10 Mbps with retransmit storms as a WAN sender on this path, while a Linux sender does 77-92 Mbps clean (iperf3 + captures prove the path itself is loss-free: UDP 80 Mbps = 0%). Split TCP at the gateway gives both WAN directions a Linux sender. socat now runs as systemd unit `smb-relay.service` on the gateway (1 MB blocks, nodelay, no nice, autostart).
 - **winfspy install**: may need Visual C++ build tools if no wheel is available. Check `pip install winfspy` first.
-- **Process lifetime**: the FUSE mount runs as long as the process lives. For auto-start, use a scheduled task or Windows service wrapper.
+- **Process lifetime**: the FUSE mount runs as long as the process lives. Auto-start is provided: `mount.ps1` via Task Scheduler on Windows (register command in README), `./mount.sh install` (launchd agent) on macOS. VSCode "NAS: Remount all" tasks restart everything manually.
 - **SMB credits**: smbprotocol defaults to requesting minimal credits. We echo-request credits on connect and request replenishment with each pipelined write. Without this, 8 MB writes fail with "not enough credits".
 
 ## Coding agents
