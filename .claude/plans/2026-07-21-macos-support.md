@@ -10,10 +10,10 @@ async read-ahead — sharing all perf-critical code with the Windows build.
 
 | Path | Reads | Writes |
 |------|-------|--------|
-| Native `mount_smbfs //…:3445/storage` | 11.1 MB/s (89 Mbps) | 42 MB/s (336 Mbps) |
+| Native `mount_smbfs //…:445/storage` | 11.1 MB/s (89 Mbps) | 42 MB/s (336 Mbps) |
 | Our engine, raw (same Mac) | **12.5 MB/s (line rate)** | **57 MB/s (458 Mbps)** |
 
-Native is the zero-code fallback (`open 'smb://herman@example.org:3445/storage'`),
+Native is the zero-code fallback (`open 'smb://user@example.org:445/storage'`),
 already usable today. The FUSE port is worth it for: +13% reads, +35% writes,
 controlled read-ahead for streaming (mpv), and knob parity with Windows.
 
@@ -109,7 +109,7 @@ platform-neutral.
 ## Execution order (Windows stays green throughout)
 
 1. **Extract fs_core.py** — pure refactor. Verify: `--bench`/`--bench-write`
-   from the Mac + Herman re-tests the Windows mount before proceeding.
+   from the Mac + User's re-tests the Windows mount before proceeding.
 2. **macos_fs.py + dispatch** — fusepy adapter, brew install fuse-t, mount on
    this Mac.
 3. **Test matrix on this Mac (real WAN)**: dd sequential read (target ≥12 MB/s),

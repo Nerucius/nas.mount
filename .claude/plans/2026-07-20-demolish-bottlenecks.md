@@ -2,7 +2,7 @@
 
 ## Link budget (theoretical targets)
 
-- local-site: 1000/1000 Mbps FTTH. client-site building: 600 down / 100 up. RTT ~41 ms.
+- NAS site: 1000/1000 Mbps FTTH. Client site: 600 down / 100 up. RTT ~41 ms.
 - **Reads (NAS→client)**: capped by client-site uplink = 100 Mbps ≈ **12.0 MB/s** target.
 - **Writes (client→NAS)**: capped by client-site downlink = 600 Mbps ≈ **71 MB/s** target.
 - BDP: reads need ~512 KB in flight; writes need ~3 MB in flight.

@@ -20,8 +20,8 @@ WinFsp (fuse_fs.py) / FUSE-T (macos_fs.py)
 smb_client.py — pipelined + compounded SMB2 over WAN
      │
 ┌─────────────┐    WAN 41ms RTT    ┌──────────┐    <1ms    ┌──────────────┐
-│  local-site    │───────────────────▶│ Gateway  │──────────▶│ TrueNAS CORE │
-│  M: Y: Z:   │  example.org:3445  │ socat    │  :445     │ Samba        │
+│    Local    │───────────────────▶│ Gateway  │──────────▶│ TrueNAS CORE │
+│  M: Y: Z:   │  example.org:445   │ socat    │  :445     │ Samba        │
 │  ~/nas/*    │                    │ (Debian) │           │ /mnt/storage │
 └─────────────┘                    └──────────┘           └──────────────┘
 ```
@@ -127,8 +127,8 @@ Copy `config.example.toml` to `config.toml` and edit connection details:
 ```toml
 [connection]
 host = "example.org"
-port = 3445
-user = "herman"
+port = 445
+user = "user"
 
 [tuning]
 read_size = 4194304        # 4 MB — proven optimal for ~41ms RTT

@@ -76,7 +76,7 @@ python nas_mount.py --bench media\somefile.mkv --bench-size 64
 
 ## Proven benchmarks (raw smbprotocol from macOS over real WAN, 2026-07-20, ~41ms RTT)
 
-Reads (line rate = client-site 100 Mbps uplink):
+Reads (line rate = remote-site 100 Mbps uplink):
 
 | Mode | Speed | Notes |
 |-----------|-------|-------|
@@ -96,7 +96,7 @@ Depth sweeps showed write_size=4MB/depth=4-6 is the sweet spot; deeper/larger do
 SMB signing cannot be disabled client-side (Samba rejects unsigned TreeConnect).
 
 Mounted filesystems, final results (2026-07-21). Line rates: reads capped by
-client-site's 100 Mbps uplink, writes by its 600 Mbps downlink:
+the remote site's 100 Mbps uplink, writes by its 600 Mbps downlink:
 
 | Platform | Read | Write | Notes |
 |----------|------|-------|-------|

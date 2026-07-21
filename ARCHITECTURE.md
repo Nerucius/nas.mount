@@ -22,7 +22,7 @@ fuse_fs.py (NTSTATUS)          macos_fs.py (errno)
 
 ### Why the gateway proxy (socat) stays
 
-The WAN path client-site→local-site has burst-sensitive behavior that FreeBSD 13.1's
+The WAN path has burst-sensitive behavior that FreeBSD 13.1's
 base TCP stack (no RACK/pacing, TrueNAS CORE ships no alternative stack) handles
 terribly as a sender: measured 10 Mbps with ~28% retransmit storms, while a
 Linux sender achieves 77-92 Mbps with zero retransmits on the same path minute

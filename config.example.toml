@@ -1,7 +1,7 @@
 [connection]
 host = "example.org"
-port = 3445
-user = "herman"
+port = 445
+user = "user"
 password = ""  # or set NAS_MOUNT_PASSWORD env var
 
 [tuning]
