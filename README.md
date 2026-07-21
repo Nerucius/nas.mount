@@ -68,7 +68,15 @@ pip install -r requirements.txt   # picks winfspy or fusepy per platform
 ```
 
 On macOS, mounts land under `~/nas/<name>` by default (configurable via the
-`[macos]` section in config.toml).
+`[macos]` section in config.toml). Finder groups them under the server name
+set by `[macos] location` (default `TrueNAS`); FUSE-T requires that name to
+resolve to loopback, so enable it once with:
+
+```bash
+echo "127.0.0.1 TrueNAS" | sudo tee -a /etc/hosts
+```
+
+(otherwise the mounts keep FUSE-T's default `fuse-t` label).
 
 ## Usage
 

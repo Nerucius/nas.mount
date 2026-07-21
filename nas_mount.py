@@ -382,6 +382,23 @@ def run_mount_macos(config, debug=False):
     mounted = []  # (mountpoint, thread)
     mounted_ops = []
 
+    # Server name Finder groups the mounts under (default would be
+    # "fuse-t"). FUSE-T requires the alias to resolve to 127.0.0.1; if it
+    # doesn't, keep FUSE-T's default rather than degrade to "localhost".
+    location = macos_cfg.get("location", "TrueNAS")
+    if location:
+        import socket
+        try:
+            resolved = socket.gethostbyname(location)
+        except OSError:
+            resolved = None
+        if resolved != "127.0.0.1":
+            print(f"  NOTE: '{location}' does not resolve to 127.0.0.1; "
+                  f"mounts will show as 'fuse-t' in Finder.")
+            print(f"        Fix once with: echo '127.0.0.1 {location}' "
+                  f"| sudo tee -a /etc/hosts")
+            location = None
+
     print("=" * 60)
     print("  nas-mount (macOS)")
     print("=" * 60)
@@ -425,6 +442,7 @@ def run_mount_macos(config, debug=False):
                     "debug": debug,
                     "rwsize": macos_cfg.get("rwsize", 1048576),
                     "daemon_timeout": macos_cfg.get("daemon_timeout", 600),
+                    "location": location,
                 },
                 name=f"fuse-{drive}",
                 daemon=True,

@@ -438,8 +438,11 @@ class SmbMacOperations(Operations):
 
 
 def mount_macos(ops, mountpoint, volume_label, foreground=True, debug=False,
-                rwsize=1048576, daemon_timeout=600):
-    """Mount one share; blocks until unmounted (run in a thread per mount)."""
+                rwsize=1048576, daemon_timeout=600, location=None):
+    """Mount one share; blocks until unmounted (run in a thread per mount).
+    location: server name Finder shows for the mounts (default 'fuse-t');
+    the name must resolve to 127.0.0.1 via /etc/hosts or FUSE-T silently
+    falls back to 'localhost'."""
     os.makedirs(mountpoint, exist_ok=True)
     kwargs = {
         "foreground": foreground,
@@ -453,6 +456,8 @@ def mount_macos(ops, mountpoint, volume_label, foreground=True, debug=False,
         # Bigger NFS transfer size: fewer, larger callbacks (default 32K).
         "rwsize": rwsize,
     }
+    if location:
+        kwargs["location"] = location
     if debug:
         kwargs["debug"] = True
     FUSE(ops, mountpoint, **kwargs)

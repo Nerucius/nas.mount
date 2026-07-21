@@ -30,6 +30,7 @@ Z = "TrueNAS Backups"
 
 [macos]
 mount_root = "~/nas"     # each mount lands at <mount_root>/<subpath basename>
+location = "TrueNAS"     # server name in Finder; needs "127.0.0.1 TrueNAS" in /etc/hosts
 rwsize = 1048576         # FUSE-T NFS transfer size (default 32K without this)
 daemon_timeout = 600     # seconds before the kernel force-ejects a slow volume
 # Optional explicit mountpoint overrides per drive key:

@@ -17,6 +17,13 @@ LOG="$SCRIPT_DIR/nas-mount.log"
 case "${1:-}" in
 install)
     [ -x "$PYTHON" ] || { echo "no venv at $PYTHON - run: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"; exit 1; }
+    # Finder shows the mounts under [macos] location; FUSE-T needs the
+    # alias to resolve to loopback or it keeps its default 'fuse-t'.
+    LOC=$(cd "$SCRIPT_DIR" && "$PYTHON" -c 'import tomllib; print(tomllib.load(open("config.toml","rb")).get("macos",{}).get("location","TrueNAS"))' 2>/dev/null || true)
+    if [ -n "$LOC" ] && ! grep -qE "^127\.0\.0\.1[[:space:]]+$LOC\$" /etc/hosts; then
+        echo "note: '$LOC' missing from /etc/hosts - Finder will show 'fuse-t' until you run:"
+        echo "      echo '127.0.0.1 $LOC' | sudo tee -a /etc/hosts"
+    fi
     mkdir -p "$HOME/Library/LaunchAgents"
     cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
