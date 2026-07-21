@@ -38,8 +38,8 @@ is 600 Mbps down / 100 Mbps up, so line rate is 12.5 MB/s for reads and
 
 | Platform | Read | Write |
 |----------|------|-------|
-| Windows (Explorer, 2 GB sustained) | **12.8 MB/s** | **76 MB/s (608 Mbps)** |
-| macOS (FUSE-T) | **12.7 MB/s** | 50–54 MB/s |
+| Windows (Explorer, 2 GB sustained) | **12.8 MB/s (102.4 Mbps)** | **76 MB/s (608 Mbps)** |
+| macOS (FUSE-T) | **12.7 MB/s (101.6 mbps)** | 50–54 MB/s (432 Mbps) |
 | rclone SMB (before) | 5.0 MB/s | ~20 MB/s |
 
 Both directions saturate the link on Windows; macOS reads saturate too and
