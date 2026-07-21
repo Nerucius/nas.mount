@@ -142,3 +142,6 @@ FreeBSD sysctls persisted as TrueNAS tunables: `kern.ipc.maxsockbuf=16M`,
 
 Plans go in `.claude/plans`, no exceptions.
 Don't use `gh`, this repo uses a PAT to act as the github link and all commits should be under the user defined in conf.toml. 
+Do not add attributions to Claude or any other coding agents into commit authorship.
+
+@CLAUDE.local.md
