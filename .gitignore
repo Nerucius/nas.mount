@@ -1,4 +1,5 @@
 config.toml
+CLAUDE.local.md
 nas-mount.log
 __pycache__/
 *.pyc
