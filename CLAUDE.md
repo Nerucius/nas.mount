@@ -42,11 +42,12 @@ nas.mount/
 ├── config.example.toml     # Template config (no secrets)
 ├── config.toml             # Local config with credentials (gitignored)
 ├── requirements.txt
-├── nas_mount.py            # Entry point - arg parsing, platform dispatch, benchmarks
-├── smb_client.py           # SMB connection wrapper: pipelined reads/writes, compound metadata ops, reconnect
-├── fs_core.py              # Platform-agnostic engine: read-ahead, write pipeline, caches, async deletes
-├── fuse_fs.py              # Windows adapter (winfspy/WinFsp) over fs_core
-├── macos_fs.py             # macOS adapter (fusepy/FUSE-T) over fs_core
+├── src/
+│   ├── nas_mount.py        # Entry point - arg parsing, platform dispatch, benchmarks
+│   ├── smb_client.py       # SMB connection wrapper: pipelined reads/writes, compound metadata ops, reconnect
+│   ├── fs_core.py          # Platform-agnostic engine: read-ahead, write pipeline, caches, async deletes
+│   ├── win_fs.py           # Windows adapter (winfspy/WinFsp) over fs_core
+│   └── macos_fs.py         # macOS adapter (fusepy/FUSE-T) over fs_core
 ├── mount.ps1               # Windows auto-mount scheduled-task helper (register: see README)
 ├── mount.sh                # macOS auto-mount launchd helper (install/uninstall/status)
 └── .vscode/tasks.json      # "NAS: Remount all" tasks for both platforms
@@ -59,19 +60,19 @@ nas.mount/
 pip install -r requirements.txt
 
 # Run the mount (all configured drives)
-python nas_mount.py
+python src/nas_mount.py
 
 # Mount a single drive
-python nas_mount.py --drive M
+python src/nas_mount.py --drive M
 
 # Run with debug logging
-python nas_mount.py --debug
+python src/nas_mount.py --debug
 
 # Test SMB connection and benchmark (no mount)
-python nas_mount.py --test
+python src/nas_mount.py --test
 
 # Benchmark a specific file
-python nas_mount.py --bench media\somefile.mkv --bench-size 64
+python src/nas_mount.py --bench media\somefile.mkv --bench-size 64
 ```
 
 ## Proven benchmarks (raw smbprotocol from macOS over real WAN, 2026-07-20, ~41ms RTT)

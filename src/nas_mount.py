@@ -275,7 +275,7 @@ def run_mount(config, debug=False):
         run_mount_macos(config, debug=debug)
         return
     from winfspy import FileSystem
-    from fuse_fs import SmbFileSystemOperations
+    from win_fs import SmbFileSystemOperations
 
     tuning = config.get("tuning", {})
     mount_configs = parse_mount_config(config)

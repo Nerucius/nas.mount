@@ -22,4 +22,4 @@ Set-Location $scriptDir
 # wraps every stderr line (Python's normal logging output) as an ErrorRecord,
 # which prints noisy "NativeCommandError" clutter in the log even though it's
 # non-fatal under $ErrorActionPreference = 'Continue'. cmd writes raw bytes.
-cmd /c "`"$python`" nas_mount.py >> `"$logFile`" 2>&1"
+cmd /c "`"$python`" src\nas_mount.py >> `"$logFile`" 2>&1"

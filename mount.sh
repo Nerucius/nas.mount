@@ -35,7 +35,7 @@ install)
     <array>
         <string>$PYTHON</string>
         <string>-u</string>
-        <string>nas_mount.py</string>
+        <string>src/nas_mount.py</string>
     </array>
     <key>WorkingDirectory</key><string>$SCRIPT_DIR</string>
     <key>RunAtLoad</key><true/>

@@ -11,7 +11,7 @@ Windows App                    Finder / macOS app
      │                                │
 WinFsp kernel driver           FUSE-T (NFSv4 loopback)
      │                                │
-fuse_fs.py (NTSTATUS)          macos_fs.py (errno)
+win_fs.py (NTSTATUS)           macos_fs.py (errno)
      └────────────┬───────────────────┘
              fs_core.py    — read-ahead windows, write coalescing + pipeline,
                   │           dir/stat caches, lazy opens, async deletes
@@ -36,11 +36,11 @@ Linux autotuning stays active).
 
 | File | Role | Key Class |
 |------|------|-----------|
-| smb_client.py | SMB connection wrapper — connect, pipelined reads (`read_file_pipelined`), sliding-window writes (`PipelinedWriter`), list, stat, rename, delete, single-flight reconnect. Concurrent ops (smbprotocol is internally thread-safe) | `SMBClient` |
-| fs_core.py | Platform-agnostic engine — async read-ahead windows, write coalescing + backpressure, dir cache, path mapping, `FsError` taxonomy. Paths backslash-separated, timestamps FILETIME, attrs Windows bits | `FsCore`, `FileHandle` |
-| fuse_fs.py | Windows adapter — WinFsp callbacks over FsCore: NTSTATUS mapping, security descriptors, delete-on-close semantics, readdir markers | `SmbFileSystemOperations(BaseFileSystemOperations)` |
-| macos_fs.py | macOS adapter — fusepy (FUSE-T) callbacks over FsCore: errno mapping, epoch timestamps, POSIX unlink/rename, xattr fast-fail, handle table | `SmbMacOperations(Operations)` |
-| nas_mount.py | Entry point — config loading (tomllib), arg parsing, platform dispatch (win32 → winfspy, darwin → fusepy threads), benchmarks | orchestration |
+| src/smb_client.py | SMB connection wrapper — connect, pipelined reads (`read_file_pipelined`), sliding-window writes (`PipelinedWriter`), list, stat, rename, delete, single-flight reconnect. Concurrent ops (smbprotocol is internally thread-safe) | `SMBClient` |
+| src/fs_core.py | Platform-agnostic engine — async read-ahead windows, write coalescing + backpressure, dir cache, path mapping, `FsError` taxonomy. Paths backslash-separated, timestamps FILETIME, attrs Windows bits | `FsCore`, `FileHandle` |
+| src/win_fs.py | Windows adapter — WinFsp callbacks over FsCore: NTSTATUS mapping, security descriptors, delete-on-close semantics, readdir markers | `SmbFileSystemOperations(BaseFileSystemOperations)` |
+| src/macos_fs.py | macOS adapter — fusepy (FUSE-T) callbacks over FsCore: errno mapping, epoch timestamps, POSIX unlink/rename, xattr fast-fail, handle table | `SmbMacOperations(Operations)` |
+| src/nas_mount.py | Entry point — config loading (tomllib), arg parsing, platform dispatch (win32 → winfspy, darwin → fusepy threads), benchmarks | orchestration |
 
 ## Key Design Decisions
 
@@ -188,7 +188,7 @@ Per-file read/write state is guarded by `FileHandle.io_lock`; the
 single-flight reconnect. FsCore's shared thread pool (readahead_workers)
 carries prefetches, background closes and background deletes.
 
-## Adapters (fuse_fs.py / macos_fs.py)
+## Adapters (win_fs.py / macos_fs.py)
 
 ### File Handle
 
@@ -211,7 +211,7 @@ it):
 - `delete_pending`, `dirty` — set in cleanup/write, drive surgical cache
   updates at close
 
-### Windows callbacks (fuse_fs.py, thin over FsCore)
+### Windows callbacks (win_fs.py, thin over FsCore)
 
 - `get_volume_info()` — real total/free via FileFsFullSizeInformation, 60 s cached
 - `get_security_by_name(file_name)` — `lookup_or_stat` (caches, 0-1 RTT), fixed SD

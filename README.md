@@ -13,7 +13,7 @@ rclone's SMB backend uses go-smb2 which hardcodes 64 KB reads. Over a 41 ms WAN 
 ```
 Windows app / Finder
      │
-WinFsp (fuse_fs.py) / FUSE-T (macos_fs.py)
+WinFsp (win_fs.py) / FUSE-T (macos_fs.py)
      │
   fs_core.py  — read-ahead windows, write pipeline, dir/stat caches
      │
@@ -82,15 +82,15 @@ echo "127.0.0.1 TrueNAS" | sudo tee -a /etc/hosts
 
 ```
 # Mount all configured shares
-python nas_mount.py
+python src/nas_mount.py
 
 # Mount a single drive from the config
-python nas_mount.py --drive M
+python src/nas_mount.py --drive M
 
 # Connectivity test / benchmarks (no mount)
-python nas_mount.py --test
-python nas_mount.py --bench media\somefile.mkv --bench-size 64
-python nas_mount.py --bench-write
+python src/nas_mount.py --test
+python src/nas_mount.py --bench media\somefile.mkv --bench-size 64
+python src/nas_mount.py --bench-write
 ```
 
 From VSCode: `Terminal > Run Task > NAS: Remount all (macOS/Windows)` stops
