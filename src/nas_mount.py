@@ -22,6 +22,9 @@ def build_client(config, share_name=None):
     password = conn.get("password") or os.environ.get("NAS_MOUNT_PASSWORD", "")
     if share_name is None:
         share_name = list(config["mounts"].values())[0].split("/")[0]
+    if "max_reconnect_attempts" in tuning:
+        log.info("config: max_reconnect_attempts is obsolete (reconnects "
+                 "are unbounded now); remove it from [tuning]")
     return SMBClient(
         host=conn["host"],
         port=conn.get("port", 445),
@@ -33,7 +36,7 @@ def build_client(config, share_name=None):
         read_pipeline_depth=tuning.get("read_pipeline_depth", 3),
         write_pipeline_depth=tuning.get("write_pipeline_depth", 4),
         reconnect_delay=tuning.get("reconnect_delay", 5),
-        max_reconnect_attempts=tuning.get("max_reconnect_attempts", 10),
+        reconnect_max_delay=tuning.get("reconnect_max_delay", 60),
     )
 
 
@@ -297,7 +300,7 @@ def run_mount(config, debug=False):
             if share_name not in clients_by_share:
                 client = build_client(config, share_name=share_name)
                 print(f"\n  Connecting to share '{share_name}'...", end=" ", flush=True)
-                client.connect()
+                client.connect(wait=True)
                 print("OK")
                 clients_by_share[share_name] = client
             else:
@@ -412,7 +415,7 @@ def run_mount_macos(config, debug=False):
             if share_name not in clients_by_share:
                 client = build_client(config, share_name=share_name)
                 print(f"\n  Connecting to share '{share_name}'...", end=" ", flush=True)
-                client.connect()
+                client.connect(wait=True)
                 print("OK")
                 clients_by_share[share_name] = client
             else:

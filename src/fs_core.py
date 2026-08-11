@@ -109,6 +109,30 @@ _SMB_STATUS_MAP = {
 }
 
 
+# While the connection is down every op fails identically; log the first
+# occurrence, then one summary line per window instead of thousands.
+_CONN_LOST_LOG_WINDOW = 30.0
+_conn_lost_lock = threading.Lock()
+_conn_lost_last = -_CONN_LOST_LOG_WINDOW
+_conn_lost_suppressed = 0
+
+
+def _log_conn_lost(exc):
+    global _conn_lost_last, _conn_lost_suppressed
+    with _conn_lost_lock:
+        now = time.monotonic()
+        if now - _conn_lost_last < _CONN_LOST_LOG_WINDOW:
+            _conn_lost_suppressed += 1
+            return
+        if _conn_lost_suppressed:
+            log.error("SMB connection lost: %s (+%d identical in last %.0fs)",
+                      exc, _conn_lost_suppressed, now - _conn_lost_last)
+        else:
+            log.error("SMB connection lost: %s", exc)
+        _conn_lost_last = now
+        _conn_lost_suppressed = 0
+
+
 def map_smb_error(exc):
     """Translate an smbprotocol exception into FsError (always raises)."""
     if isinstance(exc, FsError):
@@ -121,7 +145,7 @@ def map_smb_error(exc):
         log.error("Unmapped SMB error: %s (0x%08x)", exc.message, status)
         raise FsError(ErrorCode.UNMAPPED, exc.message, ntstatus=status)
     if isinstance(exc, SMBConnectionClosed):
-        log.error("SMB connection lost: %s", exc)
+        _log_conn_lost(exc)
         raise FsError(ErrorCode.IO_ERROR, str(exc))
     log.error("Unexpected error: %s", exc)
     raise FsError(ErrorCode.IO_ERROR, str(exc))

@@ -1,3 +1,4 @@
+import os
 import uuid
 import time
 import logging
@@ -131,16 +132,21 @@ class SMBClient:
     smbprotocol's Connection is internally thread-safe (socket send lock,
     sequence/credit lock, dedicated receiver thread with per-request
     events), so SMB operations here run concurrently without a global
-    lock. A state lock only serializes connect/disconnect/reconnect, and
-    reconnects are single-flight: whichever thread hits the dead socket
-    first rebuilds the connection, everyone else fails fast and lets the
-    caller (Windows) retry.
+    lock. A state lock only serializes connect/disconnect/reconnect.
+
+    Roaming/reconnect model: whichever thread hits the dead socket first
+    marks the client DOWN and hands off to a single background reconnector
+    thread that retries forever (backoff reconnect_delay..reconnect_max_delay,
+    reset on system wake). While DOWN every operation fails fast with
+    SMBConnectionClosed - callers (WinFsp/FUSE) surface an I/O error and
+    retry naturally - and each failed op nudges the reconnector so recovery
+    follows user activity instead of the backoff tail.
     """
 
     def __init__(self, host, port, username, password, share_name,
                  read_size=4 * 1024 * 1024, write_size=4 * 1024 * 1024,
                  read_pipeline_depth=3, write_pipeline_depth=4,
-                 reconnect_delay=5, max_reconnect_attempts=10):
+                 reconnect_delay=5, reconnect_max_delay=60):
         self.host = host
         self.port = port
         self.username = username
@@ -151,16 +157,25 @@ class SMBClient:
         self.read_pipeline_depth = read_pipeline_depth
         self.write_pipeline_depth = write_pipeline_depth
         self.reconnect_delay = reconnect_delay
-        self.max_reconnect_attempts = max_reconnect_attempts
+        self.reconnect_max_delay = reconnect_max_delay
 
         self._state_lock = threading.RLock()
         self._connection = None
         self._session = None
         self._tree = None
 
+        # Reconnect state. _down set = disconnected, ops fail fast.
+        # _nudge wakes the reconnector early (failed op or shutdown).
+        self._down = threading.Event()
+        self._nudge = threading.Event()
+        self._shutdown = threading.Event()
+        self._reconnector = None      # background thread, spawned on drop
+        self._down_since = 0.0
+        self._last_attempt = 0.0
+
     @property
     def connected(self):
-        return self._tree is not None
+        return self._tree is not None and not self._down.is_set()
 
     def _available_credits(self):
         sw = self._connection.sequence_window
@@ -168,13 +183,41 @@ class SMBClient:
 
     # -- connection lifecycle --
 
-    def connect(self, timeout=30):
-        with self._state_lock:
-            self._connect(timeout)
+    def connect(self, timeout=30, wait=False):
+        """Establish the connection.
 
-    def _connect(self, timeout=30):
-        log.info("Connecting to %s:%d share=%s user=%s",
-                 self.host, self.port, self.share_name, self.username)
+        wait=False: single attempt, raises on failure (--test/--bench).
+        wait=True: retry forever with the reconnector's backoff (mount
+        startup - a laptop logging in before Wi-Fi is up just waits).
+        """
+        self._shutdown.clear()
+        if not wait:
+            with self._state_lock:
+                self._connect(timeout)
+                self._down.clear()
+            return
+        delay = self.reconnect_delay
+        attempt = 0
+        while not self._shutdown.is_set():
+            attempt += 1
+            self._last_attempt = time.time()
+            try:
+                with self._state_lock:
+                    self._disconnect(quiet=True)
+                    self._connect(timeout, quiet=attempt > 1)
+                    self._down.clear()
+                if attempt > 1:
+                    log.info("Connected on attempt %d", attempt)
+                return
+            except Exception as e:
+                self._log_attempt(attempt, e)
+                delay = self._backoff_wait(delay)
+        raise SMBConnectionClosed("Shut down while connecting")
+
+    def _connect(self, timeout=30, quiet=False):
+        log.log(logging.DEBUG if quiet else logging.INFO,
+                "Connecting to %s:%d share=%s user=%s",
+                self.host, self.port, self.share_name, self.username)
         self._connection = Connection(uuid.uuid4(), self.host, self.port,
                                       require_signing=True)
         self._connection.connect(timeout=timeout)
@@ -207,10 +250,16 @@ class SMBClient:
                  unc, sw["high"] - sw["low"])
 
     def disconnect(self):
+        # Stop the reconnector first so it can't race the teardown.
+        self._shutdown.set()
+        self._nudge.set()
+        t = self._reconnector
+        if t is not None and t.is_alive():
+            t.join(timeout=5)
         with self._state_lock:
             self._disconnect()
 
-    def _disconnect(self):
+    def _disconnect(self, quiet=False):
         for name, obj in [("tree", self._tree),
                           ("session", self._session),
                           ("connection", self._connection)]:
@@ -222,38 +271,90 @@ class SMBClient:
         self._tree = None
         self._session = None
         self._connection = None
-        log.info("Disconnected")
+        log.log(logging.DEBUG if quiet else logging.INFO, "Disconnected")
 
-    def reconnect(self):
-        with self._state_lock:
-            self._reconnect()
+    # -- background reconnect --
 
-    def _reconnect(self):
-        delay = self.reconnect_delay
-        for attempt in range(1, self.max_reconnect_attempts + 1):
-            log.warning("Reconnect attempt %d/%d (delay %.1fs)",
-                        attempt, self.max_reconnect_attempts, delay)
-            self._disconnect()
-            time.sleep(delay)
-            try:
-                self._connect()
-                log.info("Reconnected on attempt %d", attempt)
-                return
-            except Exception as e:
-                log.error("Reconnect attempt %d failed: %s", attempt, e)
-                delay = min(delay * 2, 60)
-        raise SMBConnectionClosed("Failed to reconnect after %d attempts"
-                                  % self.max_reconnect_attempts)
+    def _mark_down(self):
+        """Tear down and hand off to the reconnector. Caller holds
+        _state_lock and has verified the connection is actually dead."""
+        self._down.set()
+        self._down_since = time.time()
+        self._disconnect(quiet=True)
+        log.warning("Connection lost; reconnecting in background "
+                    "(backoff %ds..%ds, ops fail fast until restored)",
+                    self.reconnect_delay, self.reconnect_max_delay)
+        if self._reconnector is None or not self._reconnector.is_alive():
+            self._reconnector = threading.Thread(
+                target=self._reconnect_loop,
+                name=f"smb-reconnect-{self.share_name}", daemon=True)
+            self._reconnector.start()
+
+    def _reconnect_loop(self):
+        try:
+            delay = self.reconnect_delay
+            attempt = 0
+            while not self._shutdown.is_set():
+                attempt += 1
+                self._last_attempt = time.time()
+                try:
+                    with self._state_lock:
+                        if self._shutdown.is_set():
+                            return
+                        self._disconnect(quiet=True)
+                        self._connect(timeout=15, quiet=attempt > 1)
+                        self._down.clear()
+                    log.info("Reconnected after %d attempt(s), %.0fs down",
+                             attempt, time.time() - self._down_since)
+                    return
+                except Exception as e:
+                    self._log_attempt(attempt, e)
+                delay = self._backoff_wait(delay)
+        except Exception:
+            # The reconnector is the only way back to CONNECTED. If it
+            # dies, the process is a zombie serving EIO forever - exit so
+            # the supervisor (launchd/Task Scheduler) restarts it clean.
+            log.critical("Reconnector crashed; exiting for supervisor "
+                         "restart", exc_info=True)
+            os._exit(70)
+
+    def _backoff_wait(self, delay):
+        """Interruptible backoff sleep; returns the next delay. A wait that
+        oversleeps by 30s+ means the machine was suspended - the network
+        likely changed under us, so retry immediately at base backoff."""
+        self._nudge.clear()
+        t0 = time.time()
+        self._nudge.wait(timeout=delay)
+        if time.time() - t0 > delay + 30:
+            log.info("System wake detected; retrying now")
+            return self.reconnect_delay
+        return min(delay * 2, self.reconnect_max_delay)
+
+    def _log_attempt(self, attempt, exc):
+        # Mid-roam there is often no DNS/route for minutes; one WARNING at
+        # the start, a heartbeat INFO every 10th try, the rest DEBUG.
+        lvl = (logging.WARNING if attempt == 1 else
+               logging.INFO if attempt % 10 == 0 else logging.DEBUG)
+        log.log(lvl, "Reconnect attempt %d failed: %s", attempt, exc)
 
     def _with_reconnect(self, fn):
+        if self._down.is_set():
+            # Fail fast, but let user activity pull the next attempt
+            # forward instead of waiting out the backoff tail.
+            if time.time() - self._last_attempt >= self.reconnect_delay:
+                self._nudge.set()
+            raise SMBConnectionClosed("SMB connection is down (reconnecting)")
         failed_conn = self._connection
         try:
             return fn()
         except CONNECTION_ERRORS as e:
-            log.warning("Connection lost (%s), checking connection", e)
+            if self._down.is_set():
+                raise SMBConnectionClosed(
+                    "SMB connection is down (reconnecting)") from e
+            log.warning("Connection error (%s), checking connection", e)
             with self._state_lock:
-                # Single-flight: only reconnect if nobody else already did.
-                if self._connection is not failed_conn:
+                # Single-flight: only act if nobody else already did.
+                if self._down.is_set() or self._connection is not failed_conn:
                     raise
                 # Ops on handles from a previous connection raise the same
                 # errors; don't tear down a healthy connection for them.
@@ -261,7 +362,13 @@ class SMBClient:
                     self._connection.echo(sid=self._session.session_id)
                     log.info("Connection is healthy (stale handle error)")
                 except Exception:
-                    self._reconnect()
+                    self._mark_down()
+            raise
+        except AttributeError as e:
+            # Teardown race: _disconnect() nulled the internals mid-op.
+            if self._down.is_set():
+                raise SMBConnectionClosed(
+                    "SMB connection is down (reconnecting)") from e
             raise
 
     # -- reads --

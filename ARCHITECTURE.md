@@ -16,7 +16,7 @@ win_fs.py (NTSTATUS)           macos_fs.py (errno)
              fs_core.py    — read-ahead windows, write coalescing + pipeline,
                   │           dir/stat caches, lazy opens, async deletes
              smb_client.py — pipelined reads/writes, compound metadata ops,
-                  │           credit negotiation, single-flight reconnect
+                  │           credit negotiation, background reconnect
              SMB2 over WAN → socat @ gateway → TrueNAS Samba
 ```
 
@@ -36,7 +36,7 @@ Linux autotuning stays active).
 
 | File | Role | Key Class |
 |------|------|-----------|
-| src/smb_client.py | SMB connection wrapper — connect, pipelined reads (`read_file_pipelined`), sliding-window writes (`PipelinedWriter`), list, stat, rename, delete, single-flight reconnect. Concurrent ops (smbprotocol is internally thread-safe) | `SMBClient` |
+| src/smb_client.py | SMB connection wrapper — connect, pipelined reads (`read_file_pipelined`), sliding-window writes (`PipelinedWriter`), list, stat, rename, delete, background reconnect (fail-fast while down). Concurrent ops (smbprotocol is internally thread-safe) | `SMBClient` |
 | src/fs_core.py | Platform-agnostic engine — async read-ahead windows, write coalescing + backpressure, dir cache, path mapping, `FsError` taxonomy. Paths backslash-separated, timestamps FILETIME, attrs Windows bits | `FsCore`, `FileHandle` |
 | src/win_fs.py | Windows adapter — WinFsp callbacks over FsCore: NTSTATUS mapping, security descriptors, delete-on-close semantics, readdir markers | `SmbFileSystemOperations(BaseFileSystemOperations)` |
 | src/macos_fs.py | macOS adapter — fusepy (FUSE-T) callbacks over FsCore: errno mapping, epoch timestamps, POSIX unlink/rename, xattr fast-fail, handle table | `SmbMacOperations(Operations)` |
@@ -46,8 +46,9 @@ Linux autotuning stays active).
 
 - **Concurrent SMB ops, no global lock** — smbprotocol's Connection is internally
   thread-safe (socket send lock, sequence/credit lock, dedicated receiver thread
-  with per-request events). A state lock only covers connect/disconnect, and
-  reconnects are single-flight.
+  with per-request events). A state lock only covers connect/disconnect; drop detection is
+  single-flight and reconnection runs in a background thread while ops
+  fail fast.
 - **Pipelined reads** — `read_file_pipelined()` keeps `read_pipeline_depth`
   (default 3) read requests in flight via `send=False`, so the pipe never
   drains between 4 MB chunks. Measured at the full 100 Mbps line rate vs
@@ -124,9 +125,10 @@ On connect, echo requests loop until the credit pool covers both pipelines
 
 ### Public Methods
 
-- `connect()` — establish Connection, Session, TreeConnect, request credits
-- `disconnect()` — clean teardown
-- `reconnect()` — disconnect + connect with exponential backoff
+- `connect(wait=False)` — establish Connection, Session, TreeConnect, request
+  credits; `wait=True` retries forever with backoff (mount startup before the
+  network is up)
+- `disconnect()` — stop the reconnector, clean teardown
 - `open_file(path, read, write)` → Open — always includes DELETE access
 - `open_and_read(path, length, write)` → (Open, bytes) — CREATE+READ
   compound: open-and-sniff in one round trip
@@ -165,15 +167,34 @@ source keeps producing while the network transmits.
 
 ### Reconnection Strategy
 
-Every public method wraps SMB calls in try/except for connection errors. On failure:
-1. Log the error
-2. Echo-probe the current connection first — an error from a stale handle
+The client is a two-state machine — CONNECTED ⇄ DOWN — built for a roaming
+laptop: reconnection happens in a background thread, never inline, and never
+gives up.
+
+Every public method wraps SMB calls in try/except for connection errors. On
+failure:
+1. Echo-probe the current connection first — an error from a stale handle
    (opened before a previous reconnect) must not tear down a healthy
    connection
-3. Call `_reconnect()` with exponential backoff (5s, 10s, 20s, ... capped at
-   60s, up to `max_reconnect_attempts`), single-flight across threads
-4. Re-raise if reconnect fails — surfaces as NTSTATUS/errno in the adapter
-5. Do NOT auto-retry the original operation — the OS retries
+2. If the probe fails, mark DOWN (single-flight across threads), tear down,
+   and spawn the reconnector thread
+3. Re-raise — surfaces as NTSTATUS/errno in the adapter
+4. Do NOT auto-retry the original operation — the OS retries
+
+While DOWN, ops fail fast with `SMBConnectionClosed` before touching the
+wire — Finder/Explorer get an instant I/O error instead of a hang — and each
+failed op nudges the reconnector (rate-gated to one nudge per
+`reconnect_delay`) so recovery follows user activity instead of waiting out
+the backoff tail.
+
+The reconnector retries forever: backoff doubles from `reconnect_delay` (5s)
+to `reconnect_max_delay` (60s cap). A backoff wait that oversleeps by 30s+
+means the machine was suspended — the network likely changed — so the delay
+resets to base and the next attempt fires immediately. Attempt logging is
+tiered (first WARNING, every 10th INFO, rest DEBUG): mid-roam DNS failures
+are the normal state, not an alarm. If the reconnector thread itself dies,
+the process exits(70) so launchd/Task Scheduler restarts it clean — a wedged
+mounter must never outlive its usefulness.
 
 ### Thread Safety
 
@@ -184,8 +205,8 @@ dispatcher threads run concurrently without serializing at a client-wide lock.
 Streaming a movie no longer blocks Explorer metadata operations.
 
 Per-file read/write state is guarded by `FileHandle.io_lock`; the
-`SMBClient._state_lock` (RLock) covers connection lifecycle only, with
-single-flight reconnect. FsCore's shared thread pool (readahead_workers)
+`SMBClient._state_lock` (RLock) covers connection lifecycle only;
+reconnection runs in a single background thread. FsCore's shared thread pool (readahead_workers)
 carries prefetches, background closes and background deletes.
 
 ## Adapters (win_fs.py / macos_fs.py)
@@ -308,13 +329,15 @@ smbprotocol's `SMBResponseException` contains an NTSTATUS code. Key mappings:
 - `0xC0000035` (NameCollision) → `STATUS_OBJECT_NAME_COLLISION`
 - `0xC0000043` (SharingViolation) → `STATUS_SHARING_VIOLATION`
 - `0xC0000101` (DirectoryNotEmpty) → `NTStatusDirectoryNotEmpty`
-- Connection errors → attempt reconnect, then `STATUS_UNEXPECTED_IO_ERROR`
+- Connection errors → `STATUS_UNEXPECTED_IO_ERROR` (fail fast; background
+  reconnect restores the connection)
 
 ## Status
 
 All phases complete: SMB client with pipelined+compounded ops, Windows and
-macOS mounts sharing the fs_core engine, reconnect with single-flight backoff
-and echo health checks, full error mapping, multi-mount orchestration with
+macOS mounts sharing the fs_core engine, unbounded background reconnect with
+echo health checks and wake detection, full error mapping, multi-mount
+orchestration with
 graceful shutdown (drains background deletes), and auto-start on both
 platforms (`mount.ps1` scheduled task, `mount.sh` launchd agent — see
 README). Measured at line rate both directions; metadata benchmarks in

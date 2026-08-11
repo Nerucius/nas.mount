@@ -15,8 +15,8 @@ write_buffer_chunks = 3    # coalescer pressure limit, in write_size units
 dir_cache_ttl = 300        # directory listing cache in seconds
 file_info_timeout = 5000   # ms the Windows kernel caches file metadata (WinFsp)
 dir_info_timeout = 1000    # ms the kernel caches listings (short: renames/deletes show promptly)
-reconnect_delay = 5        # seconds before reconnect attempt
-max_reconnect_attempts = 10
+reconnect_delay = 5        # initial reconnect backoff, seconds
+reconnect_max_delay = 60   # backoff cap; retries continue forever (roaming)
 
 [mounts]
 M = "storage/media"
