@@ -112,6 +112,11 @@ Key macOS/FUSE-T lessons (why fs_core is shaped the way it is):
 - rwsize=1048576 mount option (default 32 KB callbacks).
 - macOS NFS has no xattr path; falls back to AppleDouble ._* files which
   Samba fruit vetoes -> in-memory junk-file sink (also .DS_Store).
+- macOS/FUSE-T mixes Unicode forms: lookups/renames arrive NFD even for
+  names our readdir just returned as NFC, while Samba matches bytes
+  verbatim -> silent rename failures and flickering lookups. fs_core keys
+  every cache in NFC, resolves the server's true byte form at the wire
+  (_server_path), and stat probes NFC then NFD on cold misses.
 
 Server-side Samba tuning (applied on TrueNAS via midclt, persisted):
 ```

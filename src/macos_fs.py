@@ -9,6 +9,7 @@ import stat as stat_m
 import errno
 import logging
 import threading
+import unicodedata
 
 # FUSE-T ships a libfuse-2-ABI-compatible dylib; point fusepy at it before
 # import unless the user already chose a library.
@@ -98,7 +99,14 @@ class SmbMacOperations(Operations):
     # -- helpers --
 
     def _p(self, path):
-        """POSIX path -> engine (backslash) path."""
+        """POSIX path -> engine (backslash) path.
+
+        Normalized to NFC: macOS/FUSE-T sends NFD spellings for the very
+        names our readdir returned in NFC (and mixes forms across ops),
+        while the engine keys everything NFC and resolves the server's
+        true byte form at the wire (fs_core._server_path)."""
+        if not path.isascii():
+            path = unicodedata.normalize("NFC", path)
         p = path.replace("/", "\\")
         return p if p else "\\"
 

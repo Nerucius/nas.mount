@@ -19,6 +19,7 @@ import time
 import bisect
 import logging
 import threading
+import unicodedata
 from enum import Enum, auto
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -31,6 +32,24 @@ from smbprotocol.exceptions import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def canon(s):
+    """Canonical Unicode form (NFC) for engine paths and cache keys.
+
+    macOS (FUSE-T/NFS) hands us NFD spellings for the very names our own
+    readdir just returned, while Windows and most tools produce NFC - and
+    Samba matches names byte-verbatim. Everything inside the engine is
+    keyed NFC; the wire sends the server's true byte form (_server_path).
+    """
+    return s if s.isascii() else unicodedata.normalize("NFC", s)
+
+
+def _name_key(name):
+    """Name comparison key: case-insensitive (SMB semantics) and Unicode
+    normalization-insensitive."""
+    return canon(name).lower()
+
 
 EPOCH_AS_FILETIME = 116444736000000000  # 1601-01-01 in 100ns ticks
 
@@ -246,7 +265,7 @@ class FsCore:
     # -- path helpers (paths are backslash-separated, "\\" is the root) --
 
     def to_smb_path(self, path):
-        relative = path.lstrip("\\")
+        relative = canon(path.lstrip("\\"))
         if self._subpath:
             return f"{self._subpath}\\{relative}" if relative else self._subpath
         return relative
@@ -289,6 +308,38 @@ class FsCore:
     def invalidate_parent_cache(self, path):
         self.invalidate_cache(self.to_smb_path(self.parent_path(path)))
 
+    def _server_path(self, smb_path):
+        """Map a canonical (NFC) engine path to the server's true byte
+        form, component by component, via cached listings (with the stat
+        cache as a per-leaf fallback). The server matches names verbatim,
+        so wire ops must send exactly what a listing returned - which may
+        be NFD or any other form. Components we know nothing about pass
+        through unchanged (canonical NFC, the dominant server form)."""
+        if smb_path.isascii():
+            return smb_path
+        parts = smb_path.split("\\")
+        true_parts = []
+        canon_prefix = ""
+        for part in parts:
+            true = part
+            if not part.isascii():
+                cached = self._get_cached_dir(canon_prefix)
+                if cached is not None:
+                    key = _name_key(part)
+                    for e in cached:
+                        if _name_key(e["file_name"]) == key:
+                            true = e["file_name"]
+                            break
+                else:
+                    child = self._child_smb_path(canon_prefix, part)
+                    with self._cache_lock:
+                        entry = self._stat_cache.get(child)
+                        if entry and entry[1] and "file_name" in entry[1]:
+                            true = entry[1]["file_name"]
+            true_parts.append(true)
+            canon_prefix = self._child_smb_path(canon_prefix, part)
+        return "\\".join(true_parts)
+
     # -- surgical cache edits --
     # Bulk namespace changes (Explorer deleting/copying/renaming hundreds of
     # files) must not blow away the parent listing per file: that would
@@ -298,18 +349,19 @@ class FsCore:
 
     @staticmethod
     def _child_smb_path(parent_smb, name):
+        name = canon(name)
         return f"{parent_smb}\\{name}" if parent_smb else name
 
     def _cache_remove_entry(self, parent_smb, name):
         """A path we deleted: drop it from the parent's cached listing,
         cache the negative stat, drop anything cached beneath it."""
-        name_lower = name.lower()
+        name_key = _name_key(name)
         smb_path = self._child_smb_path(parent_smb, name)
         with self._cache_lock:
             cached = self._dir_cache.get(parent_smb)
             if cached:
                 cached[1][:] = [e for e in cached[1]
-                                if e["file_name"].lower() != name_lower]
+                                if _name_key(e["file_name"]) != name_key]
             self._dir_cache.pop(smb_path, None)
             prefix = smb_path + "\\"
             for key in [k for k in self._stat_cache
@@ -320,13 +372,13 @@ class FsCore:
     def _cache_insert_entry(self, parent_smb, entry):
         """A path we created: add it to the parent's cached listing (if
         one is live) and cache the positive stat."""
-        name_lower = entry["file_name"].lower()
+        name_key = _name_key(entry["file_name"])
         smb_path = self._child_smb_path(parent_smb, entry["file_name"])
         with self._cache_lock:
             cached = self._dir_cache.get(parent_smb)
             if cached:
                 cached[1][:] = [e for e in cached[1]
-                                if e["file_name"].lower() != name_lower]
+                                if _name_key(e["file_name"]) != name_key]
                 cached[1].append(entry)
                 cached[1].sort(key=lambda e: e["file_name"].lower())
             self._stat_cache[smb_path] = (time.monotonic(), entry)
@@ -336,13 +388,13 @@ class FsCore:
         cached listing and stat cache instead of invalidating them."""
         smb_path = handle.smb_path
         parent_smb = smb_path.rsplit("\\", 1)[0] if "\\" in smb_path else ""
-        name_lower = self.file_name(handle.path).lower()
+        name_key = _name_key(self.file_name(handle.path))
         with self._cache_lock:
             cached = self._dir_cache.get(parent_smb)
             entry = None
             if cached:
                 for e in cached[1]:
-                    if e["file_name"].lower() == name_lower:
+                    if _name_key(e["file_name"]) == name_key:
                         entry = e
                         break
             if entry is not None:
@@ -360,21 +412,21 @@ class FsCore:
         """A path we renamed: move the listing entry, drop stale stats."""
         old_smb = self._child_smb_path(old_parent_smb, old_name)
         new_smb = self._child_smb_path(new_parent_smb, new_name)
-        old_lower, new_lower = old_name.lower(), new_name.lower()
+        old_key, new_key = _name_key(old_name), _name_key(new_name)
         with self._cache_lock:
             moved = None
             cached = self._dir_cache.get(old_parent_smb)
             if cached:
                 for e in cached[1]:
-                    if e["file_name"].lower() == old_lower:
+                    if _name_key(e["file_name"]) == old_key:
                         moved = dict(e, file_name=new_name)
                         break
                 cached[1][:] = [e for e in cached[1]
-                                if e["file_name"].lower() != old_lower]
+                                if _name_key(e["file_name"]) != old_key]
             target = self._dir_cache.get(new_parent_smb)
             if target:
                 target[1][:] = [e for e in target[1]
-                                if e["file_name"].lower() != new_lower]
+                                if _name_key(e["file_name"]) != new_key]
                 if moved is not None:
                     target[1].append(moved)
                     target[1].sort(key=lambda e: e["file_name"].lower())
@@ -406,7 +458,7 @@ class FsCore:
         # A live listing must not resurrect files whose background delete
         # is still in flight.
         self._drain_deletes(smb_path)
-        raw = self._smb.list_directory(smb_path)
+        raw = self._smb.list_directory(self._server_path(smb_path))
         entries = []
         for item in raw:
             name = item["file_name"]
@@ -432,28 +484,47 @@ class FsCore:
         cached = self._get_cached_dir(parent_smb)
         if cached is None:
             return None
-        name_lower = self.file_name(path).lower()
+        name_key = _name_key(self.file_name(path))
         for entry in cached:
-            if entry["file_name"].lower() == name_lower:
+            if _name_key(entry["file_name"]) == name_key:
                 return entry
         return None
 
     def stat(self, path):
-        """Direct SMB stat; None if the path does not exist."""
+        """Direct SMB stat; None if the path does not exist. Non-ASCII
+        leaves are probed in NFC first, then NFD - the server matches
+        byte-verbatim and either form may be what is stored. The form
+        that answered rides along as "file_name" so _server_path can
+        route later wire ops to the true name via the stat cache."""
         smb_path = self.to_smb_path(path)
-        try:
-            st = self._smb.stat_path(smb_path)
-            return {
-                "file_attributes": normalize_attrs(st["file_attributes"]),
-                "file_size": st["end_of_file"],
-                "allocation_size": st["allocation_size"],
-                "creation_time": smb_dt_to_filetime(st["creation_time"]),
-                "last_access_time": smb_dt_to_filetime(st["last_access_time"]),
-                "last_write_time": smb_dt_to_filetime(st["last_write_time"]),
-                "change_time": smb_dt_to_filetime(st["change_time"]),
-            }
-        except (ObjectNameNotFound, ObjectPathNotFound):
+        wire_path = self._server_path(smb_path)
+        candidates = [wire_path]
+        leaf = wire_path.rsplit("\\", 1)[-1]
+        if not leaf.isascii():
+            nfd = unicodedata.normalize("NFD", leaf)
+            if nfd != leaf:
+                candidates.append(wire_path[:len(wire_path) - len(leaf)] + nfd)
+        st = None
+        found = None
+        for cand in candidates:
+            try:
+                st = self._smb.stat_path(cand)
+                found = cand
+                break
+            except (ObjectNameNotFound, ObjectPathNotFound):
+                continue
+        if st is None:
             return None
+        return {
+            "file_name": found.rsplit("\\", 1)[-1],
+            "file_attributes": normalize_attrs(st["file_attributes"]),
+            "file_size": st["end_of_file"],
+            "allocation_size": st["allocation_size"],
+            "creation_time": smb_dt_to_filetime(st["creation_time"]),
+            "last_access_time": smb_dt_to_filetime(st["last_access_time"]),
+            "last_write_time": smb_dt_to_filetime(st["last_write_time"]),
+            "change_time": smb_dt_to_filetime(st["change_time"]),
+        }
 
     def lookup_or_stat(self, path):
         """Best metadata available without opening. A fresh parent listing
@@ -557,8 +628,8 @@ class FsCore:
         smb_open = None
         if not is_dir:
             try:
-                smb_open = self._smb.open_file(smb_path, read=True,
-                                               write=want_write)
+                smb_open = self._smb.open_file(self._server_path(smb_path),
+                                               read=True, write=want_write)
             except SMBResponseException as e:
                 if e.status == STATUS_FILE_IS_A_DIRECTORY:
                     is_dir = True
@@ -606,8 +677,9 @@ class FsCore:
         built from a possibly-stale cached listing."""
         if handle.smb_open is not None or handle.is_directory:
             return
-        handle.smb_open = self._smb.open_file(handle.smb_path, read=True,
-                                              write=handle.want_write)
+        handle.smb_open = self._smb.open_file(
+            self._server_path(handle.smb_path), read=True,
+            write=handle.want_write)
         handle.file_size = handle.smb_open.end_of_file
         handle.allocation_size = handle.smb_open.allocation_size
 
@@ -617,7 +689,8 @@ class FsCore:
         # must order after the delete.
         self._drain_deletes(self.to_smb_path(self.parent_path(path)))
         try:
-            smb_open = self._smb.create_file(smb_path, is_directory=is_dir)
+            smb_open = self._smb.create_file(self._server_path(smb_path),
+                                             is_directory=is_dir)
         except Exception as e:
             log.error("create(%s) failed: %s", path, e)
             map_smb_error(e)
@@ -926,7 +999,7 @@ class FsCore:
                     # its head in a single compound round trip, and prime
                     # window 0 with the result.
                     smb_open, head = self._smb.open_and_read(
-                        handle.smb_path, HEAD_FETCH_SIZE,
+                        self._server_path(handle.smb_path), HEAD_FETCH_SIZE,
                         write=handle.want_write)
                     handle.smb_open = smb_open
                     handle.file_size = smb_open.end_of_file
@@ -1122,12 +1195,15 @@ class FsCore:
         stays warm; ordering-sensitive ops drain per-parent."""
         smb_path = self.to_smb_path(path)
         parent_smb = self.to_smb_path(self.parent_path(path))
+        # Resolve the true server name BEFORE the cache edit removes the
+        # very entry the resolver needs.
+        wire_path = self._server_path(smb_path)
         self._cache_remove_entry(parent_smb, self.file_name(path))
         if is_dir:
             # The server checks emptiness; our children must be gone first.
             self._drain_deletes(smb_path)
         fut = self._executor.submit(
-            self._delete_worker, smb_path, parent_smb, is_dir)
+            self._delete_worker, wire_path, parent_smb, is_dir)
         with self._del_lock:
             pending = self._pending_deletes.setdefault(parent_smb, [])
             pending[:] = [f for f in pending if not f.done()]
@@ -1140,7 +1216,7 @@ class FsCore:
         actually be on the server."""
         smb_path = self.to_smb_path(path)
         self._drain_deletes(smb_path)
-        self._smb.delete_directory(smb_path)
+        self._smb.delete_directory(self._server_path(smb_path))
         self._cache_remove_entry(
             self.to_smb_path(self.parent_path(path)),
             self.file_name(path))
@@ -1176,7 +1252,7 @@ class FsCore:
         smb_path = self.to_smb_path(path)
         self._drain_deletes(smb_path)
         try:
-            entries = self._smb.list_directory(smb_path)
+            entries = self._smb.list_directory(self._server_path(smb_path))
             real = [e for e in entries if e["file_name"] not in (".", "..")]
             if real:
                 raise FsError(ErrorCode.DIR_NOT_EMPTY, path)
@@ -1198,7 +1274,12 @@ class FsCore:
             self._drain_deletes(old_parent)
             if new_parent != old_parent:
                 self._drain_deletes(new_parent)
-            self._smb.rename(old_smb, new_smb,
+            # Wire forms: the source must be the server's true byte form;
+            # the destination resolves too so replace_if_exists targets an
+            # existing file even when its stored form differs (a genuinely
+            # new name passes through canonical).
+            self._smb.rename(self._server_path(old_smb),
+                             self._server_path(new_smb),
                              replace_if_exists=replace_if_exists)
             if handle is not None:
                 handle.path = new_path

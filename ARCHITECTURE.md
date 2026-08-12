@@ -107,6 +107,15 @@ Linux autotuning stays active).
   both pipelines; every pipelined request asks for replenishment; senders drain
   in-flight responses when the sequence window runs low (smbprotocol raises
   rather than blocks on credit exhaustion).
+- **Unicode-normalization insensitivity** — macOS (FUSE-T/NFS) sends NFD
+  spellings for names the server stores as NFC (and vice versa), Windows
+  sends NFC, and Samba matches bytes verbatim. The engine canonicalizes all
+  paths and cache keys to NFC (`canon`/`_name_key`, alongside the existing
+  case-insensitivity), and every wire op maps its path back to the server's
+  true byte form via cached listings (`_server_path`); cold stats probe NFC
+  then NFD and remember which form answered. Without this, renaming or
+  deleting an accented-name file on macOS fails server-side — and FUSE-T
+  reports the failed rename as success to the caller.
 
 ## SMB Client (smb_client.py)
 
