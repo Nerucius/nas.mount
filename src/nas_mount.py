@@ -5,6 +5,7 @@ import tomllib
 import logging
 import argparse
 import threading
+import subprocess
 
 from smb_client import SMBClient
 
@@ -371,8 +372,75 @@ def run_mount(config, debug=False):
         print("  Done.")
 
 
+def _loopback_watchdog(mountpoints, interval, timeout):
+    """FUSE-T serves the kernel NFS client from threads inside this
+    process; after a long system sleep the kernel side can wedge
+    permanently - it stops sending RPCs, every FS call hangs forever,
+    and nothing in-process ever errors (root-caused 2026-08-13: fuse-t
+    idle in recvfrom, nfsstat frozen, mounts dead all day).
+
+    Probe each mount through the kernel with a fresh, uncacheable
+    lookup. Any answer - including ENOENT or the fail-fast EIO served
+    while the SMB link is down - proves the loopback is alive; only
+    silence is a wedge. Two consecutive silent probes force-unmount
+    everything and exit(75) so launchd restarts a clean mount."""
+    strikes = dict.fromkeys(mountpoints, 0)
+    while True:
+        time.sleep(interval)
+        for mp in mountpoints:
+            probe = os.path.join(mp, f".nas-wd-{time.monotonic_ns()}")
+            done = threading.Event()
+
+            def _stat(p=probe, d=done):
+                try:
+                    os.stat(p)
+                except OSError:
+                    pass
+                d.set()
+
+            threading.Thread(target=_stat, daemon=True,
+                             name="wd-probe").start()
+            if done.wait(timeout):
+                strikes[mp] = 0
+                continue
+            strikes[mp] += 1
+            log.warning("watchdog: %s gave no answer in %ds (strike %d/2)",
+                        mp, timeout, strikes[mp])
+            if strikes[mp] >= 2:
+                log.critical("watchdog: kernel/FUSE-T loopback wedged at "
+                             "%s; restarting for a clean mount", mp)
+                for m in mountpoints:
+                    subprocess.run(["diskutil", "unmount", "force", m],
+                                   capture_output=True)
+                os._exit(75)
+
+
+def _unmount_stale(mountpoint):
+    """A previous incarnation may have died with the volume still
+    mounted (watchdog exit, SIGKILL); mounting over it fails. Detect via
+    `mount` output - never by touching the path, which could hang - and
+    wait for the detach to settle: FUSE() into a still-busy mountpoint
+    fails with -1 and takes the whole process down."""
+    def mounted():
+        listing = subprocess.run(["mount"], capture_output=True,
+                                 text=True).stdout
+        return f" on {mountpoint} " in listing
+    if not mounted():
+        return
+    print(f"  Removing stale mount at {mountpoint}...", flush=True)
+    subprocess.run(["umount", mountpoint], capture_output=True)
+    if mounted():
+        subprocess.run(["diskutil", "unmount", "force", mountpoint],
+                       capture_output=True)
+    for _ in range(10):
+        if not mounted():
+            return
+        time.sleep(0.5)
+    log.warning("stale mount at %s did not detach; mount may fail "
+                "(supervisor will retry)", mountpoint)
+
+
 def run_mount_macos(config, debug=False):
-    import subprocess
     from macos_fs import SmbMacOperations, mount_macos
 
     tuning = config.get("tuning", {})
@@ -434,6 +502,7 @@ def run_mount_macos(config, debug=False):
             basename = (subpath.split("/")[-1] if subpath else share_name).lower()
             mountpoint = os.path.expanduser(
                 overrides.get(drive, os.path.join(mount_root, basename)))
+            _unmount_stale(mountpoint)
 
             label = f"{mountpoint} -> {share_name}/{subpath}" if subpath \
                 else f"{mountpoint} -> {share_name}"
@@ -456,6 +525,15 @@ def run_mount_macos(config, debug=False):
 
         print(f"\n  {len(mounted)} mount(s) active. Press Ctrl+C to stop.")
         print("=" * 60)
+
+        wd_interval = macos_cfg.get("watchdog_interval", 120)
+        if wd_interval > 0:
+            threading.Thread(
+                target=_loopback_watchdog,
+                args=([mp for mp, _ in mounted], wd_interval,
+                      macos_cfg.get("watchdog_timeout", 20)),
+                daemon=True, name="loopback-watchdog").start()
+            log.info("loopback watchdog: probing every %ds", wd_interval)
 
         # FUSE threads block until their volume is unmounted. Converge on
         # shutdown whether we get KeyboardInterrupt here or libfuse's own

@@ -328,6 +328,18 @@ For each configured mount (e.g., `M = "storage/media"`):
 
 Main loop blocks on `threading.Event().wait()` until Ctrl+C, then stops all mounts.
 
+On macOS a loopback watchdog guards the layer no in-process code can see
+fail: the kernel NFS client talking to FUSE-T's in-process NFS server can
+wedge permanently after a long system sleep (no RPCs, every FS call hangs,
+zero errors anywhere). The watchdog stats a fresh nonexistent name under
+each mountpoint every `watchdog_interval` (120s) in a throwaway thread; any
+answer within `watchdog_timeout` (20s) - including ENOENT or the fail-fast
+EIO served while the SMB link is down - proves the loopback alive. Two
+consecutive silent probes: force-unmount all volumes, exit(75), launchd
+restarts a clean process, which also force-unmounts any stale volumes a
+killed predecessor left behind (checked via `mount` output, never by
+touching the possibly-wedged path).
+
 ## Error Mapping
 
 smbprotocol's `SMBResponseException` contains an NTSTATUS code. Key mappings:

@@ -117,6 +117,14 @@ Key macOS/FUSE-T lessons (why fs_core is shaped the way it is):
   verbatim -> silent rename failures and flickering lookups. fs_core keys
   every cache in NFC, resolves the server's true byte form at the wire
   (_server_path), and stat probes NFC then NFD on cold misses.
+- After a long system sleep the kernel NFS client can wedge against
+  FUSE-T's in-process NFS server: no RPCs sent, every FS call hangs, no
+  in-process error (fuse-t idle in recvfrom, nfsstat frozen). A watchdog
+  probes each mount through the kernel with fresh uncacheable lookups -
+  any answer (even EIO/ENOENT) is healthy, only silence is a wedge; two
+  strikes force-unmount and exit(75) for a launchd restart. Stale mounts
+  from a killed predecessor are force-unmounted before mounting (detected
+  via `mount` output, never by touching the path).
 
 Server-side Samba tuning (applied on TrueNAS via midclt, persisted):
 ```
