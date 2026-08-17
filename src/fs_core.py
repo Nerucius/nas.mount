@@ -671,15 +671,29 @@ class FsCore:
             want_write=want_write,
         )
 
+    def _invalidate_phantom(self, handle):
+        """A lazy open discovered the server no longer has this file.
+        Evict it from dir/stat caches so subsequent opens fail
+        immediately instead of producing repeated read-time errors."""
+        parent_smb = (handle.smb_path.rsplit("\\", 1)[0]
+                      if "\\" in handle.smb_path else "")
+        name = self.file_name(handle.path)
+        self._cache_remove_entry(parent_smb, name)
+        log.debug("invalidated phantom cache entry: %s", handle.path)
+
     def _ensure_open(self, handle):
         """Materialize a lazily-opened handle (call with io_lock held).
         The create response is authoritative for size - the handle was
         built from a possibly-stale cached listing."""
         if handle.smb_open is not None or handle.is_directory:
             return
-        handle.smb_open = self._smb.open_file(
-            self._server_path(handle.smb_path), read=True,
-            write=handle.want_write)
+        try:
+            handle.smb_open = self._smb.open_file(
+                self._server_path(handle.smb_path), read=True,
+                write=handle.want_write)
+        except (ObjectNameNotFound, ObjectPathNotFound):
+            self._invalidate_phantom(handle)
+            raise
         handle.file_size = handle.smb_open.end_of_file
         handle.allocation_size = handle.smb_open.allocation_size
 
@@ -998,9 +1012,14 @@ class FsCore:
                     # Lazy handle + header sniff: open the file and read
                     # its head in a single compound round trip, and prime
                     # window 0 with the result.
-                    smb_open, head = self._smb.open_and_read(
-                        self._server_path(handle.smb_path), HEAD_FETCH_SIZE,
-                        write=handle.want_write)
+                    try:
+                        smb_open, head = self._smb.open_and_read(
+                            self._server_path(handle.smb_path),
+                            HEAD_FETCH_SIZE,
+                            write=handle.want_write)
+                    except (ObjectNameNotFound, ObjectPathNotFound):
+                        self._invalidate_phantom(handle)
+                        raise
                     handle.smb_open = smb_open
                     handle.file_size = smb_open.end_of_file
                     handle.allocation_size = smb_open.allocation_size
