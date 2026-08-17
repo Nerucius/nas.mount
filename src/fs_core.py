@@ -51,6 +51,17 @@ def _name_key(name):
     return canon(name).lower()
 
 
+def _path_key(path):
+    """Dictionary key for an SMB path.
+
+    Windows can send a different case for the same path on each callback.
+    Keep the caller/server spelling in handles and directory entries, but
+    index all path-scoped state with case- and normalization-insensitive
+    keys so those callbacks share one coherent cache entry.
+    """
+    return canon(path).lower()
+
+
 EPOCH_AS_FILETIME = 116444736000000000  # 1601-01-01 in 100ns ticks
 
 FILE_ATTRIBUTE_DIRECTORY = 0x10
@@ -177,7 +188,7 @@ class FileHandle:
                  "change_time", "io_lock",
                  "ra_windows", "ra_futures", "ra_partial",
                  "writer", "wsegs", "delete_pending", "dirty",
-                 "want_write")
+                 "want_write", "content_version")
 
     def __init__(self, path, smb_path, smb_open=None, is_directory=False,
                  file_attributes=0, file_size=0, allocation_size=0,
@@ -190,6 +201,7 @@ class FileHandle:
         # Lazy open: a cache-hit open defers the SMB CREATE until the first
         # data operation; want_write records the access to open with then.
         self.want_write = want_write
+        self.content_version = 0
         self.file_attributes = file_attributes
         self.file_size = file_size
         self.allocation_size = allocation_size
@@ -239,7 +251,8 @@ class FsCore:
 
     def __init__(self, smb_client, subpath="", dir_cache_ttl=300,
                  readahead_windows=2, readahead_workers=8,
-                 write_buffer_chunks=3, volume_label="NAS"):
+                 write_buffer_chunks=3, volume_label="NAS",
+                 on_phantom=None):
         self._smb = smb_client
         self._subpath = subpath.replace("/", "\\")
         self._dir_cache_ttl = dir_cache_ttl
@@ -247,15 +260,28 @@ class FsCore:
         # Positive AND negative stat results (info dict or None), same TTL
         # as the dir cache. Explorer re-walks the ancestor chain of every
         # path it touches; without this each component is a round trip.
-        self._stat_cache = {}  # smb_path -> (monotonic_ts, info | None)
+        self._stat_cache = {}  # _path_key(smb_path) -> (ts, info | None)
         self._cache_lock = threading.Lock()
         # Pipelined deletes: Explorer deletes folders file-by-file and
         # serially; running each 1-RTT delete in the background overlaps
         # them. Keyed by parent so ordering-sensitive ops can drain.
-        self._pending_deletes = {}  # parent_smb -> [Future]
+        self._pending_deletes = {}  # _path_key(parent_smb) -> [Future]
         self._del_lock = threading.Lock()
+        # Write buffers belong to SMB handles, but Windows file visibility is
+        # per file: a read/open on a second handle must observe writes already
+        # accepted on the first. Track dirty handles by path so cross-handle
+        # boundaries can drain them without sacrificing batching within one
+        # sequential writer.
+        self._writers_by_path = {}
+        self._writers_lock = threading.Lock()
+        # Per-path generations invalidate read-ahead cached by sibling file
+        # handles after any write/truncate. This is the content counterpart
+        # to refreshing EOF metadata across handles.
+        self._content_versions = {}
+        self._content_lock = threading.Lock()
         self._readahead_windows = readahead_windows
         self._write_buffer_chunks = write_buffer_chunks
+        self._on_phantom = on_phantom
         self.volume_label = volume_label
         self._vol_info = None
         self._vol_info_ts = 0
@@ -286,23 +312,25 @@ class FsCore:
 
     def _get_cached_dir(self, smb_path):
         with self._cache_lock:
-            entry = self._dir_cache.get(smb_path)
+            entry = self._dir_cache.get(_path_key(smb_path))
             if entry and (time.monotonic() - entry[0]) < self._dir_cache_ttl:
                 return entry[1]
         return None
 
     def _set_cached_dir(self, smb_path, entries):
         with self._cache_lock:
-            self._dir_cache[smb_path] = (time.monotonic(), entries)
+            self._dir_cache[_path_key(smb_path)] = (
+                time.monotonic(), entries)
 
     def invalidate_cache(self, smb_path):
+        smb_key = _path_key(smb_path)
         with self._cache_lock:
-            self._dir_cache.pop(smb_path, None)
+            self._dir_cache.pop(smb_key, None)
             # Drop stat entries for the path itself and everything below it
             # (covers children of a changed dir and renamed/deleted trees).
-            prefix = smb_path + "\\" if smb_path else ""
+            prefix = smb_key + "\\" if smb_key else ""
             for key in [k for k in self._stat_cache
-                        if k == smb_path or k.startswith(prefix)]:
+                        if k == smb_key or k.startswith(prefix)]:
                 del self._stat_cache[key]
 
     def invalidate_parent_cache(self, path):
@@ -312,30 +340,27 @@ class FsCore:
         """Map a canonical (NFC) engine path to the server's true byte
         form, component by component, via cached listings (with the stat
         cache as a per-leaf fallback). The server matches names verbatim,
-        so wire ops must send exactly what a listing returned - which may
-        be NFD or any other form. Components we know nothing about pass
+        so wire ops must send exactly what a listing returned - including
+        its case and Unicode form. Components we know nothing about pass
         through unchanged (canonical NFC, the dominant server form)."""
-        if smb_path.isascii():
-            return smb_path
         parts = smb_path.split("\\")
         true_parts = []
         canon_prefix = ""
         for part in parts:
             true = part
-            if not part.isascii():
-                cached = self._get_cached_dir(canon_prefix)
-                if cached is not None:
-                    key = _name_key(part)
-                    for e in cached:
-                        if _name_key(e["file_name"]) == key:
-                            true = e["file_name"]
-                            break
-                else:
-                    child = self._child_smb_path(canon_prefix, part)
-                    with self._cache_lock:
-                        entry = self._stat_cache.get(child)
-                        if entry and entry[1] and "file_name" in entry[1]:
-                            true = entry[1]["file_name"]
+            cached = self._get_cached_dir(canon_prefix)
+            if cached is not None:
+                key = _name_key(part)
+                for e in cached:
+                    if _name_key(e["file_name"]) == key:
+                        true = e["file_name"]
+                        break
+            else:
+                child = self._child_smb_path(canon_prefix, part)
+                with self._cache_lock:
+                    entry = self._stat_cache.get(_path_key(child))
+                    if entry and entry[1] and "file_name" in entry[1]:
+                        true = entry[1]["file_name"]
             true_parts.append(true)
             canon_prefix = self._child_smb_path(canon_prefix, part)
         return "\\".join(true_parts)
@@ -357,31 +382,35 @@ class FsCore:
         cache the negative stat, drop anything cached beneath it."""
         name_key = _name_key(name)
         smb_path = self._child_smb_path(parent_smb, name)
+        parent_key = _path_key(parent_smb)
+        smb_key = _path_key(smb_path)
         with self._cache_lock:
-            cached = self._dir_cache.get(parent_smb)
+            cached = self._dir_cache.get(parent_key)
             if cached:
                 cached[1][:] = [e for e in cached[1]
                                 if _name_key(e["file_name"]) != name_key]
-            self._dir_cache.pop(smb_path, None)
-            prefix = smb_path + "\\"
+            self._dir_cache.pop(smb_key, None)
+            prefix = smb_key + "\\"
             for key in [k for k in self._stat_cache
-                        if k == smb_path or k.startswith(prefix)]:
+                        if k == smb_key or k.startswith(prefix)]:
                 del self._stat_cache[key]
-            self._stat_cache[smb_path] = (time.monotonic(), None)
+            self._stat_cache[smb_key] = (time.monotonic(), None)
 
     def _cache_insert_entry(self, parent_smb, entry):
         """A path we created: add it to the parent's cached listing (if
         one is live) and cache the positive stat."""
         name_key = _name_key(entry["file_name"])
         smb_path = self._child_smb_path(parent_smb, entry["file_name"])
+        parent_key = _path_key(parent_smb)
+        smb_key = _path_key(smb_path)
         with self._cache_lock:
-            cached = self._dir_cache.get(parent_smb)
+            cached = self._dir_cache.get(parent_key)
             if cached:
                 cached[1][:] = [e for e in cached[1]
                                 if _name_key(e["file_name"]) != name_key]
                 cached[1].append(entry)
                 cached[1].sort(key=lambda e: e["file_name"].lower())
-            self._stat_cache[smb_path] = (time.monotonic(), entry)
+            self._stat_cache[smb_key] = (time.monotonic(), entry)
 
     def _cache_update_entry(self, handle):
         """A file we wrote/truncated: refresh size and times in the
@@ -389,8 +418,10 @@ class FsCore:
         smb_path = handle.smb_path
         parent_smb = smb_path.rsplit("\\", 1)[0] if "\\" in smb_path else ""
         name_key = _name_key(self.file_name(handle.path))
+        parent_key = _path_key(parent_smb)
+        smb_key = _path_key(smb_path)
         with self._cache_lock:
-            cached = self._dir_cache.get(parent_smb)
+            cached = self._dir_cache.get(parent_key)
             entry = None
             if cached:
                 for e in cached[1]:
@@ -403,19 +434,110 @@ class FsCore:
                 entry["file_attributes"] = handle.file_attributes
                 entry["last_write_time"] = handle.last_write_time
                 entry["change_time"] = handle.change_time
-                self._stat_cache[smb_path] = (time.monotonic(), entry)
             else:
-                self._stat_cache.pop(smb_path, None)
+                # The parent need not have been listed yet. Keep a standalone
+                # positive stat entry rather than discarding the only current
+                # size and forcing the next handle to ask the server while
+                # this handle's writes are still buffered.
+                entry = {
+                    "file_name": self.file_name(handle.path),
+                    "file_attributes": handle.file_attributes,
+                    "file_size": handle.file_size,
+                    "allocation_size": handle.allocation_size,
+                    "creation_time": handle.creation_time,
+                    "last_access_time": handle.last_access_time,
+                    "last_write_time": handle.last_write_time,
+                    "change_time": handle.change_time,
+                }
+            self._stat_cache[smb_key] = (time.monotonic(), entry)
+
+    def _register_writer(self, handle):
+        key = _path_key(handle.smb_path)
+        with self._writers_lock:
+            self._writers_by_path.setdefault(key, set()).add(handle)
+
+    def _unregister_writer(self, handle):
+        key = _path_key(handle.smb_path)
+        with self._writers_lock:
+            handles = self._writers_by_path.get(key)
+            if handles is None:
+                return
+            handles.discard(handle)
+            if not handles:
+                self._writers_by_path.pop(key, None)
+
+    def _drain_path_writers(self, smb_path, exclude=None):
+        """Make accepted writes visible across all handles for a file."""
+        key = _path_key(smb_path)
+        with self._writers_lock:
+            handles = list(self._writers_by_path.get(key, ()))
+        for other in handles:
+            if other is exclude:
+                continue
+            with other.io_lock:
+                self._drain_writes(other)
+
+    def refresh_handle_info(self, handle):
+        """Apply metadata changed through another handle to this handle.
+
+        WinFsp file contexts can outlive many writes on sibling contexts.
+        Windows requires those existing handles to observe the current EOF;
+        the stat cache is updated synchronously by every write/truncate.
+        """
+        key = _path_key(handle.smb_path)
+        with self._cache_lock:
+            cached = self._stat_cache.get(key)
+            info = cached[1] if cached is not None else None
+            if info is None:
+                return
+            old_size = handle.file_size
+            handle.file_attributes = info["file_attributes"]
+            handle.file_size = info["file_size"]
+            handle.allocation_size = info["allocation_size"]
+            handle.creation_time = info["creation_time"]
+            handle.last_access_time = info["last_access_time"]
+            handle.last_write_time = info["last_write_time"]
+            handle.change_time = info["change_time"]
+        if handle.file_size > old_size:
+            # A window ending at the old EOF was complete when fetched but is
+            # only a prefix after another handle grows the file. Mark every
+            # now-short cached window so _get_window fetches its new tail.
+            wsize = self._window_size()
+            for wstart, data in handle.ra_windows.items():
+                expected = min(wsize, handle.file_size - wstart)
+                if len(data) < expected:
+                    handle.ra_partial.add(wstart)
+
+    def _mark_content_changed(self, handle):
+        key = _path_key(handle.smb_path)
+        with self._content_lock:
+            if len(self._content_versions) > 4096:
+                self._content_versions.clear()
+            version = self._content_versions.get(key, 0) + 1
+            self._content_versions[key] = version
+            handle.content_version = version
+
+    def _sync_content_version(self, handle):
+        key = _path_key(handle.smb_path)
+        with self._content_lock:
+            version = self._content_versions.get(key, 0)
+        if handle.content_version != version:
+            self._drop_readahead(handle)
+            handle.content_version = version
 
     def _cache_move_entry(self, old_parent_smb, old_name,
                           new_parent_smb, new_name):
         """A path we renamed: move the listing entry, drop stale stats."""
         old_smb = self._child_smb_path(old_parent_smb, old_name)
         new_smb = self._child_smb_path(new_parent_smb, new_name)
+        old_parent_key = _path_key(old_parent_smb)
+        new_parent_key = _path_key(new_parent_smb)
+        old_smb_key = _path_key(old_smb)
+        new_smb_key = _path_key(new_smb)
         old_key, new_key = _name_key(old_name), _name_key(new_name)
         with self._cache_lock:
             moved = None
-            cached = self._dir_cache.get(old_parent_smb)
+            cached = self._dir_cache.get(old_parent_key)
             if cached:
                 for e in cached[1]:
                     if _name_key(e["file_name"]) == old_key:
@@ -423,7 +545,7 @@ class FsCore:
                         break
                 cached[1][:] = [e for e in cached[1]
                                 if _name_key(e["file_name"]) != old_key]
-            target = self._dir_cache.get(new_parent_smb)
+            target = self._dir_cache.get(new_parent_key)
             if target:
                 target[1][:] = [e for e in target[1]
                                 if _name_key(e["file_name"]) != new_key]
@@ -433,10 +555,10 @@ class FsCore:
                 else:
                     # We know nothing about the moved entry; the target
                     # listing can no longer be trusted.
-                    self._dir_cache.pop(new_parent_smb, None)
+                    self._dir_cache.pop(new_parent_key, None)
             # A renamed directory invalidates everything cached beneath
             # both the old and the new path.
-            for base in (old_smb, new_smb):
+            for base in (old_smb_key, new_smb_key):
                 self._dir_cache.pop(base, None)
                 prefix = base + "\\"
                 for key in [k for k in self._stat_cache
@@ -445,9 +567,9 @@ class FsCore:
                 for key in [k for k in self._dir_cache
                             if k.startswith(prefix)]:
                     del self._dir_cache[key]
-            self._stat_cache[old_smb] = (time.monotonic(), None)
+            self._stat_cache[old_smb_key] = (time.monotonic(), None)
             if moved is not None:
-                self._stat_cache[new_smb] = (time.monotonic(), moved)
+                self._stat_cache[new_smb_key] = (time.monotonic(), moved)
 
     def list_dir(self, smb_path):
         """TTL-cached directory listing, entries in winfsp-style dicts
@@ -539,15 +661,16 @@ class FsCore:
         if self._get_cached_dir(parent_smb) is not None:
             return None
         smb_path = self.to_smb_path(path)
+        smb_key = _path_key(smb_path)
         with self._cache_lock:
-            entry = self._stat_cache.get(smb_path)
+            entry = self._stat_cache.get(smb_key)
             if entry and (time.monotonic() - entry[0]) < self._dir_cache_ttl:
                 return entry[1]
         info = self.stat(path)
         with self._cache_lock:
             if len(self._stat_cache) > 4096:
                 self._stat_cache.clear()
-            self._stat_cache[smb_path] = (time.monotonic(), info)
+            self._stat_cache[smb_key] = (time.monotonic(), info)
         return info
 
     # -- volume info --
@@ -582,6 +705,16 @@ class FsCore:
         on STATUS_FILE_IS_A_DIRECTORY.
         dir_hint: caller believes this is a directory (cache-miss only)."""
         smb_path = self.to_smb_path(path)
+        smb_key = _path_key(smb_path)
+
+        # Windows guarantees that a newly opened handle observes writes which
+        # earlier WriteFile calls accepted on another handle. Our network
+        # batching is per handle, so establish that visibility boundary here.
+        try:
+            self._drain_path_writers(smb_path)
+        except Exception as e:
+            log.error("open(%s) draining peer writes failed: %s", path, e)
+            map_smb_error(e)
 
         if self.is_root(path):
             return FileHandle(
@@ -600,7 +733,7 @@ class FsCore:
             # listing) is NOT_FOUND without touching the server - a
             # background delete may still be in flight for this name.
             with self._cache_lock:
-                entry = self._stat_cache.get(smb_path)
+                entry = self._stat_cache.get(smb_key)
                 if entry and (time.monotonic() - entry[0]) < self._dir_cache_ttl:
                     info = entry[1]
                     if info is None:
@@ -679,6 +812,14 @@ class FsCore:
                       if "\\" in handle.smb_path else "")
         name = self.file_name(handle.path)
         self._cache_remove_entry(parent_smb, name)
+        if self._on_phantom is not None:
+            try:
+                self._on_phantom(handle.path)
+            except Exception as e:
+                # Cache repair must still succeed if a platform-specific
+                # kernel notification is unavailable.
+                log.warning("phantom notification(%s) failed: %s",
+                            handle.path, e)
         log.debug("invalidated phantom cache entry: %s", handle.path)
 
     def _ensure_open(self, handle):
@@ -742,44 +883,47 @@ class FsCore:
         return handle
 
     def close_handle(self, handle):
-        with handle.io_lock:
-            if (handle.smb_open is not None
-                    and not handle.delete_pending and not handle.dirty):
-                # Clean read-only handle: nothing to drain and nobody
-                # depends on close ordering - release the caller now and
-                # close in the background (after any in-flight prefetches
-                # let go of the SMB handle). Explorer closes a handle per
-                # file it sniffs; a synchronous close is a round trip each.
-                futures = list(handle.ra_futures.values())
-                for fut in futures:
-                    fut.cancel()
-                handle.ra_futures = {}
-                handle.ra_windows = OrderedDict()
-                handle.ra_partial = set()
-                smb_open = handle.smb_open
-                handle.smb_open = None
-                self._executor.submit(self._close_quietly, smb_open,
-                                      futures)
-                return
-            self._drop_readahead(handle, wait=True)
-            if handle.smb_open is not None:
-                if handle.delete_pending:
-                    self._discard_writes(handle)
-                else:
-                    try:
-                        self._drain_writes(handle)
-                    except Exception as e:
-                        log.error("flush on close(%s) failed: %s",
-                                  handle.path, e)
-                self._smb.close_file(handle.smb_open)
-                handle.smb_open = None
-                handle.writer = None
-        if handle.delete_pending:
-            return  # caches were edited surgically at mark_delete time
-        if handle.dirty:
-            # Refresh the written file's size/times in place - a bulk copy
-            # must not blow away the parent listing per file.
-            self._cache_update_entry(handle)
+        try:
+            with handle.io_lock:
+                if (handle.smb_open is not None
+                        and not handle.delete_pending and not handle.dirty):
+                    # Clean read-only handle: nothing to drain and nobody
+                    # depends on close ordering - release the caller now and
+                    # close in the background (after any in-flight prefetches
+                    # let go of the SMB handle). Explorer closes a handle per
+                    # file it sniffs; a synchronous close is a round trip each.
+                    futures = list(handle.ra_futures.values())
+                    for fut in futures:
+                        fut.cancel()
+                    handle.ra_futures = {}
+                    handle.ra_windows = OrderedDict()
+                    handle.ra_partial = set()
+                    smb_open = handle.smb_open
+                    handle.smb_open = None
+                    self._executor.submit(self._close_quietly, smb_open,
+                                          futures)
+                    return
+                self._drop_readahead(handle, wait=True)
+                if handle.smb_open is not None:
+                    if handle.delete_pending:
+                        self._discard_writes(handle)
+                    else:
+                        try:
+                            self._drain_writes(handle)
+                        except Exception as e:
+                            log.error("flush on close(%s) failed: %s",
+                                      handle.path, e)
+                    self._smb.close_file(handle.smb_open)
+                    handle.smb_open = None
+                    handle.writer = None
+            if handle.delete_pending:
+                return  # caches were edited surgically at mark_delete time
+            if handle.dirty:
+                # Refresh the written file's size/times in place - a bulk copy
+                # must not blow away the parent listing per file.
+                self._cache_update_entry(handle)
+        finally:
+            self._unregister_writer(handle)
 
     def _close_quietly(self, smb_open, futures):
         """Background close: wait out prefetches that still reference the
@@ -1006,7 +1150,10 @@ class FsCore:
         if handle.is_directory:
             raise FsError(ErrorCode.END_OF_FILE)
         try:
+            self._drain_path_writers(handle.smb_path, exclude=handle)
             with handle.io_lock:
+                self.refresh_handle_info(handle)
+                self._sync_content_version(handle)
                 if (handle.smb_open is None
                         and offset + length <= HEAD_FETCH_SIZE):
                     # Lazy handle + header sniff: open the file and read
@@ -1055,8 +1202,15 @@ class FsCore:
         if handle.is_directory:
             raise FsError(ErrorCode.INVALID_HANDLE)
         try:
+            self._drain_path_writers(handle.smb_path, exclude=handle)
             with handle.io_lock:
+                self.refresh_handle_info(handle)
                 self._ensure_open(handle)
+                # Register on the first write before publishing any content
+                # or size change. A sibling that begins after this point will
+                # wait on this handle's I/O lock and drain the accepted bytes
+                # before it reads.
+                self._register_writer(handle)
                 data = bytes(buffer)
                 if write_to_end:
                     offset = handle.file_size
@@ -1094,7 +1248,13 @@ class FsCore:
                 handle.dirty = True
                 # Any cached read data overlapping the write is stale.
                 self._drop_readahead(handle)
-                return length
+                self._mark_content_changed(handle)
+                # Publish the new EOF while the already-registered writer's
+                # I/O lock is still held. A sibling will block on this lock
+                # and drain the accepted bytes; it cannot read the old server
+                # page and cache it under the new content version.
+                self._cache_update_entry(handle)
+            return length
         except FsError:
             raise
         except Exception as e:
@@ -1110,6 +1270,7 @@ class FsCore:
         the pipeline."""
         if handle.smb_open is not None:
             try:
+                self._drain_path_writers(handle.smb_path, exclude=handle)
                 with handle.io_lock:
                     self._drain_writes(handle)
                 # SMB FLUSH needs write access; skip it on read-only
@@ -1138,6 +1299,7 @@ class FsCore:
                 handle.last_write_time = filetime_now()
                 handle.change_time = handle.last_write_time
                 handle.dirty = True
+                self._mark_content_changed(handle)
             self._cache_update_entry(handle)
         except FsError:
             raise
@@ -1160,6 +1322,7 @@ class FsCore:
                     self._smb.set_end_of_file(handle.smb_open, new_size)
                     handle.file_size = new_size
                     handle.dirty = True
+                    self._mark_content_changed(handle)
                 handle.allocation_size = new_size
             if not allocation_only:
                 self._cache_update_entry(handle)
@@ -1176,7 +1339,8 @@ class FsCore:
         """Wait for in-flight deletes under parent_smb (never called from
         executor workers - the workers themselves wait on nothing)."""
         with self._del_lock:
-            futures = self._pending_deletes.pop(parent_smb, None)
+            futures = self._pending_deletes.pop(
+                _path_key(parent_smb), None)
         if futures:
             for fut in futures:
                 try:
@@ -1224,7 +1388,8 @@ class FsCore:
         fut = self._executor.submit(
             self._delete_worker, wire_path, parent_smb, is_dir)
         with self._del_lock:
-            pending = self._pending_deletes.setdefault(parent_smb, [])
+            pending = self._pending_deletes.setdefault(
+                _path_key(parent_smb), [])
             pending[:] = [f for f in pending if not f.done()]
             pending.append(fut)
 

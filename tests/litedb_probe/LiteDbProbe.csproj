@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+
+  <Target Name="RequireLiteDbDll" BeforeTargets="ResolveReferences"
+          Condition="'$(LiteDbDll)' == ''">
+    <Error Text="Pass -p:LiteDbDll=path-to-LiteDB.dll" />
+  </Target>
+
+  <ItemGroup>
+    <Reference Include="LiteDB">
+      <HintPath>$(LiteDbDll)</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

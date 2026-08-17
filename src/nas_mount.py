@@ -338,8 +338,12 @@ def run_mount(config, debug=False):
                 post_cleanup_when_modified_only=1,
                 um_file_context_is_user_context2=1,
                 file_system_name="nas-mount",
-                debug=debug,
+                # Python-side debug logging is targeted and readable. The
+                # native trace logs every callback and can emit megabytes
+                # during a SwarmUI scan, enough to stall the mount.
+                debug=False,
             )
+            ops.attach_file_system(fs)
 
             print(f"  Mounting {label}...", end=" ", flush=True)
             fs.start()
@@ -593,8 +597,10 @@ def main():
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
-    if not args.debug:
-        logging.getLogger("smbprotocol").setLevel(logging.WARNING)
+    # smbprotocol DEBUG includes full packet and data-buffer hex dumps. Keep
+    # --debug focused on nas-mount's own diagnostics.
+    logging.getLogger("smbprotocol").setLevel(logging.WARNING)
+    logging.getLogger("spnego").setLevel(logging.WARNING)
 
     config = load_config(args.config)
 

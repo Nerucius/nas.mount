@@ -389,7 +389,11 @@ class SMBClient:
         tid = file_open.tree_connect.tree_connect_id
         chunk_size = min(self.read_size, conn.max_read_size)
 
-        pending = deque()  # (request, receive_func, expected_len)
+        # (request, receive_func, file_offset, expected_len). SMB servers
+        # may legally satisfy a READ with fewer bytes than requested without
+        # reporting STATUS_END_OF_FILE. Keep the offset so a short response
+        # can be completed before later pipelined responses are appended.
+        pending = deque()
         parts = []
         eof = False
         pos = offset
@@ -403,9 +407,9 @@ class SMBClient:
                     break
                 msg, recv = file_open.read(pos, n, send=False)
                 request = conn.send(msg, sid, tid, credit_request=charge + 8)
-                pending.append((request, recv, n))
+                pending.append((request, recv, pos, n))
                 pos += n
-            request, recv, expected = pending.popleft()
+            request, recv, request_offset, expected = pending.popleft()
             try:
                 data = recv(request)
             except SMBResponseException as e:
@@ -416,9 +420,32 @@ class SMBClient:
             if not eof:
                 parts.append(data)
                 if len(data) < expected:
-                    # Short read: stop here so the result stays contiguous.
-                    # Remaining in-flight responses are drained and discarded.
-                    eof = True
+                    if not data:
+                        # Some servers return a successful zero-byte read at
+                        # EOF instead of STATUS_END_OF_FILE. Later pipelined
+                        # responses must still be drained, but cannot be
+                        # appended because this is now the first gap.
+                        eof = True
+                        continue
+                    # Fill this response's missing tail before consuming the
+                    # already in-flight request for the next range. Treating
+                    # every short response as EOF leaks partial 8 KiB pages to
+                    # callers such as LiteDB and corrupts their view of an
+                    # otherwise complete file.
+                    missing_offset = request_offset + len(data)
+                    missing_len = expected - len(data)
+                    log.debug(
+                        "SMB short read at offset=%d: got %d/%d bytes; "
+                        "refilling %d bytes",
+                        request_offset, len(data), expected, missing_len)
+                    charge = _credit_charge(missing_len)
+                    msg, missing_recv = file_open.read(
+                        missing_offset, missing_len, send=False)
+                    missing_request = conn.send(
+                        msg, sid, tid, credit_request=charge + 8)
+                    pending.appendleft((
+                        missing_request, missing_recv,
+                        missing_offset, missing_len))
         return b"".join(parts)
 
     # -- writes --

@@ -116,6 +116,23 @@ Linux autotuning stays active).
   then NFD and remember which form answered. Without this, renaming or
   deleting an accented-name file on macOS fails server-side — and FUSE-T
   reports the failed rename as success to the caller.
+- **Case-insensitive path indexes** — Windows may use different casing for the
+  same path across open, cleanup, and delete callbacks. Directory/stat caches
+  and pending-delete queues share case-insensitive keys, while `_server_path`
+  restores the exact casing from listings before SMB operations.
+- **Phantom removal notification (Windows)** — when a lazy open disproves a
+  cached positive entry, the engine evicts it and the Windows adapter sends a
+  WinFsp `FILE_ACTION_REMOVED` notification. This purges WinFsp's independent
+  metadata cache so an immediate open-or-create retry can reach `create`.
+- **Cross-handle write visibility** — Windows applications such as LiteDB use
+  separate readers and writers for one database/WAL. Writes remain batched
+  within a handle, but opening, reading, or writing through a sibling first
+  drains accepted peer writes. Every mutation publishes current size/times and
+  advances a per-path content generation; existing readers refresh EOF and
+  discard stale read-ahead windows (including windows that ended at the old
+  EOF) before their next read. The first write registers its handle and
+  publishes size/content changes while holding the handle I/O lock, closing
+  the race where a sibling could cache the old server page during publication.
 
 ## SMB Client (smb_client.py)
 
@@ -128,6 +145,10 @@ One `SMBClient` per unique share name. Multiple mounts to the same share reuse o
 - `threading.RLock` (`_state_lock`) — connection lifecycle only; SMB
   operations themselves run concurrently (smbprotocol is internally
   thread-safe)
+
+Pipelined reads tolerate legal short SMB responses by issuing a gap-filling
+read before appending later in-flight ranges. A short response is not treated
+as EOF unless the server reports EOF or returns zero bytes.
 
 On connect, echo requests loop until the credit pool covers both pipelines
 (`per_op_credits * (read_depth + write_depth) + 64`).
