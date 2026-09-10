@@ -48,6 +48,43 @@
                 "reveal": "always",
                 "clear": true
             }
+        },
+        {
+            "label": "NAS: Unmount all (macOS)",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "command": "pkill -INT -f '[n]as_mount.py' && for i in {1..15}; do pgrep -f '[n]as_mount.py' >/dev/null || break; sleep 1; done; pkill -9 -f '[n]as_mount.py' 2>/dev/null; echo 'All NAS drives unmounted.'",
+            "isBackground": false,
+            "problemMatcher": [],
+            "presentation": {
+                "panel": "shared",
+                "reveal": "always"
+            }
+        },
+        {
+            "label": "NAS: Unmount all (Windows)",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "powershell.exe",
+                    "args": [
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command"
+                    ]
+                }
+            },
+            "command": "Get-CimInstance Win32_Process -Filter \"Name LIKE 'python%'\" | Where-Object { $_.CommandLine -like '*nas_mount*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; Write-Host 'All NAS drives unmounted.'",
+            "isBackground": false,
+            "problemMatcher": [],
+            "presentation": {
+                "panel": "shared",
+                "reveal": "always"
+            }
         }
     ]
 }
