@@ -1,6 +1,8 @@
 {
-    // Remount tasks: stop any running nas-mount instance (unmounting the
-    // volumes) and start a fresh one in a dedicated terminal panel.
+    // Remount tasks: stop the running nas-mount instance (unmounting the
+    // volumes) and hand a fresh one to the OS service manager - launchd on
+    // macOS, Task Scheduler on Windows. The task prints the new run's
+    // startup log and exits; the mounts survive closing the terminal.
     // Terminal > Run Task... > pick the one for this machine's OS.
     "version": "2.0.0",
     "tasks": [
@@ -10,10 +12,42 @@
             "options": {
                 "cwd": "${workspaceFolder}"
             },
-            // SIGINT first: nas_mount unmounts cleanly and drains pending
-            // background deletes. The [n] trick stops pkill -f from
-            // matching this task's own shell command line.
-            "command": "pkill -INT -f '[n]as_mount.py' && for i in {1..15}; do pgrep -f '[n]as_mount.py' >/dev/null || break; sleep 1; done; pkill -9 -f '[n]as_mount.py' 2>/dev/null; ./.venv/bin/python src/nas_mount.py",
+            // mount.sh restart: SIGINT the old process (clean unmount +
+            // delete drain), bootout/bootstrap the LaunchAgent, tail the
+            // new run's startup lines. Installs the agent first if needed.
+            "command": "./mount.sh restart",
+            "isBackground": false,
+            "problemMatcher": [],
+            "presentation": {
+                "panel": "dedicated",
+                "reveal": "always",
+                "clear": true
+            }
+        },
+        {
+            "label": "NAS: Stop all (macOS)",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            // Clean unmount; the agent stays down until a remount or the
+            // next login (it is not uninstalled).
+            "command": "./mount.sh stop",
+            "isBackground": false,
+            "problemMatcher": [],
+            "presentation": {
+                "panel": "dedicated",
+                "reveal": "always",
+                "clear": true
+            }
+        },
+        {
+            "label": "NAS: Status (macOS)",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "command": "./mount.sh status; tail -n 20 nas-mount.log",
             "isBackground": false,
             "problemMatcher": [],
             "presentation": {
@@ -37,10 +71,36 @@
                     ]
                 }
             },
-            // Same process cleanup as mount.ps1, but runs the mount in
-            // this terminal so the logs are visible. WinFsp drops the
-            // drive letters as soon as the old process dies.
-            "command": "Get-CimInstance Win32_Process -Filter \"Name LIKE 'python%'\" | Where-Object { $_.CommandLine -like '*nas_mount*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; Start-Sleep -Seconds 2; & .venv\\Scripts\\python.exe src\\nas_mount.py",
+            // Restart the 'nas-mount' scheduled task so the mounter keeps
+            // running under Task Scheduler instead of this terminal. The
+            // explicit kill covers python children Stop-ScheduledTask
+            // leaves behind; WinFsp drops the drive letters as soon as the
+            // old process dies, and mount.ps1 re-kills stragglers anyway.
+            "command": "if (-not (Get-ScheduledTask -TaskName 'nas-mount' -ErrorAction SilentlyContinue)) { Write-Host 'scheduled task ''nas-mount'' is not registered - run the Register-ScheduledTask snippet from README.md (Auto-start at login) once, from an elevated PowerShell'; exit 1 }; Stop-ScheduledTask -TaskName 'nas-mount' -ErrorAction SilentlyContinue; Get-CimInstance Win32_Process -Filter \"Name LIKE 'python%'\" | Where-Object { $_.CommandLine -like '*nas_mount*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; Start-Sleep -Seconds 3; Start-ScheduledTask -TaskName 'nas-mount'; Start-Sleep -Seconds 10; Get-Content nas-mount.log -Tail 25; Write-Host '--- scheduled task nas-mount owns the mounts now; logs: nas-mount.log ---'",
+            "isBackground": false,
+            "problemMatcher": [],
+            "presentation": {
+                "panel": "dedicated",
+                "reveal": "always",
+                "clear": true
+            }
+        },
+        {
+            "label": "NAS: Stop all (Windows)",
+            "type": "shell",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "powershell.exe",
+                    "args": [
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command"
+                    ]
+                }
+            },
+            "command": "Stop-ScheduledTask -TaskName 'nas-mount' -ErrorAction SilentlyContinue; Get-CimInstance Win32_Process -Filter \"Name LIKE 'python%'\" | Where-Object { $_.CommandLine -like '*nas_mount*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; Write-Host 'stopped - re-run the remount task or log in again to mount'",
             "isBackground": false,
             "problemMatcher": [],
             "presentation": {

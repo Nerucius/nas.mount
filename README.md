@@ -94,8 +94,12 @@ python src/nas_mount.py --bench-write
 ```
 
 From VSCode: `Terminal > Run Task > NAS: Remount all (macOS/Windows)` stops
-any running instance (unmounting the volumes) and starts a fresh one in a
-dedicated terminal panel.
+any running instance (unmounting the volumes) and restarts the mounter as a
+*background service* - launchd on macOS, Task Scheduler on Windows. The task
+prints the new run's startup log, then exits: closing the terminal panel
+leaves the mounts up. `NAS: Stop all` and `NAS: Status (macOS)` are there too.
+Both remount tasks need the auto-start service installed first (below); the
+macOS one installs it for you if it is missing.
 
 ## Auto-start at login
 
@@ -121,12 +125,18 @@ logged-in user (no admin needed for the task itself).
 
 ```bash
 ./mount.sh install     # writes ~/Library/LaunchAgents/com.nas-mount.plist, mounts now
+./mount.sh restart     # clean unmount + relaunch under launchd (what the VSCode task runs)
+./mount.sh stop        # clean unmount; stays down until restart or next login
 ./mount.sh status
 ./mount.sh uninstall
 ```
 
 The agent mounts at login, restarts the mounter if it crashes (but not on a
-clean exit), and logs to `nas-mount.log`.
+clean exit), and logs to `nas-mount.log`. Every subcommand hands the mounter
+to launchd rather than running it as a child of the calling shell, so the
+mounts never die with the terminal. `restart`/`stop` SIGINT the old process
+(SIGTERM would skip the clean unmount and delete drain), wait for it to go,
+then bootout/bootstrap the agent.
 
 ## Configuration
 
