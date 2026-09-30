@@ -97,9 +97,10 @@ From VSCode: `Terminal > Run Task > NAS: Remount all (macOS/Windows)` stops
 any running instance (unmounting the volumes) and restarts the mounter as a
 *background service* - launchd on macOS, Task Scheduler on Windows. The task
 prints the new run's startup log, then exits: closing the terminal panel
-leaves the mounts up. `NAS: Stop all` and `NAS: Status (macOS)` are there too.
-Both remount tasks need the auto-start service installed first (below); the
-macOS one installs it for you if it is missing.
+leaves the mounts up. `NAS: Unmount all` stops the service (it stays down),
+and `NAS: Status (macOS)` shows the agent plus the tail of the log. Both
+remount tasks need the auto-start service installed first (below); the macOS
+one installs it for you if it is missing.
 
 ## Auto-start at login
 

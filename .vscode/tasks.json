@@ -1,8 +1,8 @@
 {
-    // Remount tasks: stop the running nas-mount instance (unmounting the
-    // volumes) and hand a fresh one to the OS service manager - launchd on
-    // macOS, Task Scheduler on Windows. The task prints the new run's
-    // startup log and exits; the mounts survive closing the terminal.
+    // Stop the running nas-mount instance (unmounting the volumes) and, for
+    // the remount tasks, hand a fresh one to the OS service manager -
+    // launchd on macOS, Task Scheduler on Windows. Remounts print the new
+    // run's startup log and exit; the mounts survive closing the terminal.
     // Terminal > Run Task... > pick the one for this machine's OS.
     "version": "2.0.0",
     "tasks": [
@@ -25,20 +25,21 @@
             }
         },
         {
-            "label": "NAS: Stop all (macOS)",
+            "label": "NAS: Unmount all (macOS)",
             "type": "shell",
             "options": {
                 "cwd": "${workspaceFolder}"
             },
-            // Clean unmount; the agent stays down until a remount or the
-            // next login (it is not uninstalled).
+            // mount.sh stop also boots the agent out, so a non-clean exit
+            // (the SIGKILL fallback) can't have launchd mount straight
+            // back up. Stays down until a remount or the next login; the
+            // agent is not uninstalled.
             "command": "./mount.sh stop",
             "isBackground": false,
             "problemMatcher": [],
             "presentation": {
-                "panel": "dedicated",
-                "reveal": "always",
-                "clear": true
+                "panel": "shared",
+                "reveal": "always"
             }
         },
         {
@@ -51,9 +52,8 @@
             "isBackground": false,
             "problemMatcher": [],
             "presentation": {
-                "panel": "dedicated",
-                "reveal": "always",
-                "clear": true
+                "panel": "shared",
+                "reveal": "always"
             }
         },
         {
@@ -86,44 +86,6 @@
             }
         },
         {
-            "label": "NAS: Stop all (Windows)",
-            "type": "shell",
-            "options": {
-                "cwd": "${workspaceFolder}",
-                "shell": {
-                    "executable": "powershell.exe",
-                    "args": [
-                        "-NoProfile",
-                        "-ExecutionPolicy",
-                        "Bypass",
-                        "-Command"
-                    ]
-                }
-            },
-            "command": "Stop-ScheduledTask -TaskName 'nas-mount' -ErrorAction SilentlyContinue; Get-CimInstance Win32_Process -Filter \"Name LIKE 'python%'\" | Where-Object { $_.CommandLine -like '*nas_mount*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; Write-Host 'stopped - re-run the remount task or log in again to mount'",
-            "isBackground": false,
-            "problemMatcher": [],
-            "presentation": {
-                "panel": "dedicated",
-                "reveal": "always",
-                "clear": true
-            }
-        },
-        {
-            "label": "NAS: Unmount all (macOS)",
-            "type": "shell",
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "command": "pkill -INT -f '[n]as_mount.py' && for i in {1..15}; do pgrep -f '[n]as_mount.py' >/dev/null || break; sleep 1; done; pkill -9 -f '[n]as_mount.py' 2>/dev/null; echo 'All NAS drives unmounted.'",
-            "isBackground": false,
-            "problemMatcher": [],
-            "presentation": {
-                "panel": "shared",
-                "reveal": "always"
-            }
-        },
-        {
             "label": "NAS: Unmount all (Windows)",
             "type": "shell",
             "options": {
@@ -138,7 +100,8 @@
                     ]
                 }
             },
-            "command": "Get-CimInstance Win32_Process -Filter \"Name LIKE 'python%'\" | Where-Object { $_.CommandLine -like '*nas_mount*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; Write-Host 'All NAS drives unmounted.'",
+            // Stop the scheduled task too, or it restarts the mounter.
+            "command": "Stop-ScheduledTask -TaskName 'nas-mount' -ErrorAction SilentlyContinue; Get-CimInstance Win32_Process -Filter \"Name LIKE 'python%'\" | Where-Object { $_.CommandLine -like '*nas_mount*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; Write-Host 'All NAS drives unmounted.'",
             "isBackground": false,
             "problemMatcher": [],
             "presentation": {
