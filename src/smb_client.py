@@ -55,6 +55,10 @@ LIST_SAFE_ENTRIES = 1600
 CONNECTION_ERRORS = (SMBConnectionClosed, ConnectionError, BrokenPipeError,
                      TimeoutError, OSError)
 
+# Connect timeout for every endpoint but the last. The earlier ones (the
+# home LAN) are optional, so a miss while away must not stall the fallback.
+ENDPOINT_PROBE_TIMEOUT = 3
+
 
 def dt_to_filetime(dt: datetime) -> int:
     if dt is None:
@@ -141,14 +145,21 @@ class SMBClient:
     SMBConnectionClosed - callers (WinFsp/FUSE) surface an I/O error and
     retry naturally - and each failed op nudges the reconnector so recovery
     follows user activity instead of the backoff tail.
+
+    Endpoints: every (re)connect tries `endpoints` in order - typically the
+    home LAN address, then a public relay - so one config works at home and
+    away. With server_guid set, a server must present that GUID in NEGOTIATE
+    before any credentials are sent to it.
     """
 
-    def __init__(self, host, port, username, password, share_name,
+    def __init__(self, endpoints, username, password, share_name,
+                 server_guid=None,
                  read_size=4 * 1024 * 1024, write_size=4 * 1024 * 1024,
                  read_pipeline_depth=3, write_pipeline_depth=4,
                  reconnect_delay=5, reconnect_max_delay=60):
-        self.host = host
-        self.port = port
+        self.endpoints = list(endpoints)
+        self.host, self.port = self.endpoints[0]   # the endpoint in use
+        self.server_guid = uuid.UUID(server_guid) if server_guid else None
         self.username = username
         self.password = password
         self.share_name = share_name
@@ -215,10 +226,27 @@ class SMBClient:
         raise SMBConnectionClosed("Shut down while connecting")
 
     def _connect(self, timeout=30, quiet=False):
+        failures = []
+        for i, (host, port) in enumerate(self.endpoints):
+            last = i == len(self.endpoints) - 1
+            try:
+                return self._connect_to(
+                    host, port,
+                    timeout if last else min(timeout, ENDPOINT_PROBE_TIMEOUT),
+                    quiet)
+            except Exception as e:
+                if len(self.endpoints) == 1:
+                    raise
+                log.debug("Endpoint %s:%d failed: %s", host, port, e)
+                self._disconnect(quiet=True)
+                failures.append(f"{host}:{port}: {e}")
+        raise ConnectionError("; ".join(failures))
+
+    def _connect_to(self, host, port, timeout, quiet):
         log.log(logging.DEBUG if quiet else logging.INFO,
                 "Connecting to %s:%d share=%s user=%s",
-                self.host, self.port, self.share_name, self.username)
-        self._connection = Connection(uuid.uuid4(), self.host, self.port,
+                host, port, self.share_name, self.username)
+        self._connection = Connection(uuid.uuid4(), host, port,
                                       require_signing=True)
         self._connection.connect(timeout=timeout)
         log.debug("SMB negotiated dialect=0x%04x max_read=%d max_write=%d signing=%s",
@@ -226,13 +254,20 @@ class SMBClient:
                   self._connection.max_read_size,
                   self._connection.max_write_size,
                   self._connection.require_signing)
+        if (self.server_guid is not None
+                and self._connection.server_guid != self.server_guid):
+            # Checked before Session.connect(): a stranger's box at the home
+            # LAN's address on another network must never get our NTLM hash.
+            raise ConnectionError(
+                f"server GUID {self._connection.server_guid} is not the "
+                f"configured {self.server_guid}; not sending credentials")
 
         self._session = Session(self._connection, self.username, self.password,
                                 require_encryption=False)
         self._session.connect()
         log.debug("Session authenticated, session_id=%s", self._session.session_id)
 
-        unc = f"\\\\{self.host}\\{self.share_name}"
+        unc = f"\\\\{host}\\{self.share_name}"
         self._tree = TreeConnect(self._session, unc)
         self._tree.connect(require_secure_negotiate=False)
 
@@ -246,8 +281,9 @@ class SMBClient:
             self._connection.echo(sid=self._session.session_id,
                                   credit_request=target)
         sw = self._connection.sequence_window
-        log.info("Connected to %s (credits: %d available)",
-                 unc, sw["high"] - sw["low"])
+        self.host, self.port = host, port
+        log.info("Connected to %s via port %d (credits: %d available)",
+                 unc, port, sw["high"] - sw["low"])
 
     def disconnect(self):
         # Stop the reconnector first so it can't race the teardown.

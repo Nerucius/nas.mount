@@ -17,6 +17,20 @@ def load_config(path="config.toml"):
         return tomllib.load(f)
 
 
+def parse_endpoints(conn):
+    """`endpoints = ["host:port", ...]` (tried in order on every connect),
+    or the single legacy `host`/`port` pair."""
+    if "endpoints" not in conn:
+        return [(conn["host"], conn.get("port", 445))]
+    endpoints = []
+    for ep in conn["endpoints"]:
+        host, sep, port = ep.rpartition(":")
+        endpoints.append((host, int(port)) if sep else (ep, 445))
+    if not endpoints:
+        raise SystemExit("config: [connection] endpoints is empty")
+    return endpoints
+
+
 def build_client(config, share_name=None):
     conn = config["connection"]
     tuning = config.get("tuning", {})
@@ -27,11 +41,11 @@ def build_client(config, share_name=None):
         log.info("config: max_reconnect_attempts is obsolete (reconnects "
                  "are unbounded now); remove it from [tuning]")
     return SMBClient(
-        host=conn["host"],
-        port=conn.get("port", 445),
+        endpoints=parse_endpoints(conn),
         username=conn["user"],
         password=password,
         share_name=share_name,
+        server_guid=conn.get("server_guid"),
         read_size=tuning.get("read_size", 4 * 1024 * 1024),
         write_size=tuning.get("write_size", 4 * 1024 * 1024),
         read_pipeline_depth=tuning.get("read_pipeline_depth", 3),
@@ -184,7 +198,7 @@ def run_test(config):
     print("=" * 60)
 
     conn = config["connection"]
-    print(f"\n  Host:  {conn['host']}:{conn.get('port', 445)}")
+    print(f"\n  Host:  {', '.join(f'{h}:{p}' for h, p in client.endpoints)}")
     print(f"  User:  {conn['user']}")
     print(f"  Share: {client.share_name}")
 
@@ -192,7 +206,9 @@ def run_test(config):
     t0 = time.perf_counter()
     client.connect()
     t_connect = time.perf_counter() - t0
-    print(f"OK ({t_connect:.1f}s)")
+    print(f"OK ({t_connect:.1f}s via {client.host}:{client.port})")
+    print(f"        Server GUID: {client._connection.server_guid}"
+          f"{'' if client.server_guid else ' (pin as [connection] server_guid)'}")
     print(f"        Dialect: SMB {client._connection.dialect:#06x}")
     print(f"        Max read: {format_size(client._connection.max_read_size)}")
     print(f"        Max write: {format_size(client._connection.max_write_size)}")

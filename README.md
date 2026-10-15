@@ -141,12 +141,17 @@ then bootout/bootstrap the agent.
 
 ## Configuration
 
-Copy `config.example.toml` to `config.toml` and edit connection details:
+Copy `config.example.toml` to `config.toml` and edit connection details.
+`endpoints` lists the server addresses in the order to try them on every
+(re)connect, so one config works at home (LAN address first, 3 s timeout)
+and away (public address). A single `host`/`port` pair still works.
+Pin `server_guid` (printed by `--test`) so a stranger's machine at your
+LAN address on another network never receives your login.
 
 ```toml
 [connection]
-host = "example.org"
-port = 445
+endpoints = ["192.168.1.10:445", "example.org:445"]  # tried in order: home LAN, then public
+server_guid = ""  # optional; `--test` prints it. Checked before credentials are sent
 user = "user"
 
 [tuning]

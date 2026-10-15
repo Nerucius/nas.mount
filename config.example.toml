@@ -1,6 +1,6 @@
 [connection]
-host = "example.org"
-port = 445
+endpoints = ["192.168.1.10:445", "example.org:445"]  # tried in order: home LAN, then public
+server_guid = ""  # optional; `--test` prints it. Checked before credentials are sent
 user = "user"
 password = ""  # or set NAS_MOUNT_PASSWORD env var
 

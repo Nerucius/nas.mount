@@ -226,6 +226,19 @@ are the normal state, not an alarm. If the reconnector thread itself dies,
 the process exits(70) so launchd/Task Scheduler restarts it clean — a wedged
 mounter must never outlive its usefulness.
 
+Every connect and reconnect walks `[connection] endpoints` in order, so one
+config serves home and away: the home LAN address first, then the public
+relay. Every endpoint but the last gets a 3s timeout (`ENDPOINT_PROBE_TIMEOUT`;
+smbprotocol applies it to both the TCP connect and the NEGOTIATE wait), so
+away from home the LAN miss costs ~3s per attempt. With `server_guid` set,
+the NEGOTIATE ServerGuid must match before `Session.connect()` sends the
+NTLM response: a stranger's box at the same private IP on another network
+never gets a hash to crack. Samba derives that GUID from the NetBIOS name,
+so it is stable and path-independent (direct, relay and hairpin all show
+the same value) but not unique: it filters random hosts, not a targeted
+attacker. A connection made through a fallback stays on it until the next
+drop; there is no upgrade back to the LAN while connected.
+
 ### Thread Safety
 
 smbprotocol's transport has its own socket send lock, the connection has a
